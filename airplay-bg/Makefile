@@ -42,7 +42,7 @@ TARGET		:=	airplay-bg
 BUILD		:=	build
 SOURCES		:=	source
 DATA		:=	data
-INCLUDES	:=	../source
+INCLUDES	:=
 #ROMFS	:=	romfs
 
 #---------------------------------------------------------------------------------

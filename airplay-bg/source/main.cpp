@@ -32,6 +32,8 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
+#include <new>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -39,6 +41,9 @@
 #include <string>
 #include <vector>
 
+#include "alac.hpp"
+#include "audio.hpp"
+#include "gfbg.h"           // the background music player's own protocol (copied from ../../sysmodule/include): to pause it
 #include "airport_key.inc"   // ../source: iOS sends nothing to a receiver that cannot sign with it. Never printed or logged.
 
 // ---- the process: heap, applet type, services ----------------------------------------------------------------------------------
@@ -85,7 +90,9 @@ void __appExit(void) {
 namespace {
 
 constexpr int kRtspPort = 5006, kAudio = 6010, kControl = 6011, kTiming = 6012;   // (the app's own are 5005 and 6000-6002)
-constexpr size_t kMaxHead = 8 * 1024, kMaxBody = 1024 * 1024;   // a cover comes in one SET_PARAMETER; beyond this a request is dropped
+constexpr size_t kMaxHead = 8 * 1024, kMaxBody = 64 * 1024;   // a SET_PARAMETER body bigger than this (a cover) is answered and thrown away as it comes
+constexpr int kSlots = 256, kPacket = 1500;                     // the packets waiting to be put in order: 256 of up to 1500 bytes
+constexpr double kAskAfter = 0.1, kGiveUpAfter = 0.6;           // a packet missing: asked for again after this, then played as silence
 constexpr const char* kLogPath = "sdmc:/config/songate-nx/airplay-bg.log";
 constexpr const char* kTxt[] = { "txtvers=1", "ch=2", "cn=0,1", "et=0,1", "ek=1", "sr=44100", "ss=16", "sv=false", "da=true", "pw=false", "md=0,1,2",
                                  "tp=UDP", "vn=65537", "vs=105.1", "sf=0x4", "am=Songate" };
@@ -174,7 +181,27 @@ struct Conn {
     uint32_t peer = 0;
     std::string in;
     double since = 0;
+    size_t skip = 0;   // bytes of a body too big to keep still to come: thrown away
 };
+
+// ---- the background music player: paused while a stream plays, played again when it ends (only if it was playing) -----------------------
+
+bool bgPause() {
+    Service s;
+    if (R_FAILED(gfbgOpen(&s, GfbgClient_Overlay))) return false;   // not running: nothing to pause
+    GfbgState st;
+    bool did = false;
+    if (R_SUCCEEDED(gfbgGetState(&s, &st)) && st.status == GfbgStatus_Playing && R_SUCCEEDED(gfbgTransport(&s, GfbgOp_Pause))) did = true;
+    serviceClose(&s);   // (opened for the call only: its sessions are few)
+    return did;
+}
+
+void bgResume() {
+    Service s;
+    if (R_FAILED(gfbgOpen(&s, GfbgClient_Overlay))) return;
+    gfbgTransport(&s, GfbgOp_Resume);
+    serviceClose(&s);
+}
 
 struct Receiver {
     // sockets
@@ -199,11 +226,28 @@ struct Receiver {
     bool quiet = false;            // a routine refresh: not logged
     bool selfTested = false;
 
+    // ---- the stream (step 2): decrypt, put in order, decode, resample, play
+    struct Slot { bool have = false, asked = false; int size = 0; double waitingSince = 0; uint8_t data[kPacket]; };
+    Slot* slots = nullptr;                 // allocated for a stream, freed when it ends
+    alac::Decoder* dec = nullptr;
+    AudioOut audio;
+    mbedtls_aes_context aes;
+    uint8_t iv[16] = {};
+    bool haveAes = false, haveNext = false, haveControl = false, bgWasPlaying = false, decodedOnce = false;
+    uint16_t nextSeq = 0, topSeq = 0;
+    uint32_t clientIp = 0;                 // audio is taken from this address only
+    sockaddr_in control{};                 // the sender's control port: where lost packets are asked for again
+    Conn* streamConn = nullptr;            // the connection that plays
+    float gain = 1.f;
+    unsigned lost = 0, repaired = 0, decodeErrors = 0;
+    int16_t pcm[alac::Decoder::kMaxFrame * 2];
+
     /** Errors that mean the network under the sockets went away (sleep, Wi-Fi lost, address changed). */
     static bool netGone(int e) { return e == 114 || e == 115 || e == 118 || e == 125 || e == 126 || e == 9 || e == 19; }
     bool anyConn() const { for (const Conn& c : conns) if (c.fd >= 0) return true; return false; }
 
     Receiver() {
+        mbedtls_aes_init(&aes);
         mbedtls_pk_init(&pk);
         if (mbedtls_pk_parse_key(&pk, reinterpret_cast<const unsigned char*>(kAirportKey), sizeof kAirportKey, nullptr, 0) == 0 &&
             mbedtls_pk_get_type(&pk) == MBEDTLS_PK_RSA) {
@@ -356,7 +400,8 @@ struct Receiver {
 
     void closeAll(bool sayGoodbye) {
         if (sayGoodbye && open && mdns >= 0) sayAnnounce(buildAnnounce(0));   // iOS lists it no longer
-        for (Conn& c : conns) { closeFd(c.fd); c.in.clear(); }
+        endStream();
+        for (Conn& c : conns) { closeFd(c.fd); c.in.clear(); c.skip = 0; }
         closeFd(mdns);
         closeFd(listener);
         for (int& m : media) closeFd(m);
@@ -413,20 +458,119 @@ struct Receiver {
         return out;
     }
 
-    /** Whether the stream's description could be played: its AES key unwraps and its format is the one iOS sends (44.1 kHz stereo 16-bit ALAC). */
-    bool playable(const std::string& body) {
+    /** An ANNOUNCE: takes the stream's AES key out of its wrapping, checks its format (44.1 kHz stereo 16-bit ALAC) and gets ready for it. */
+    bool setupStream(const std::string& body) {
+        endStream();
         if (!rsa) return false;
         const std::vector<uint8_t> w = unbase64(lineOf(body, "a=rsaaeskey:")), i = unbase64(lineOf(body, "a=aesiv:"));
         if (w.size() != mbedtls_rsa_get_len(rsa) || i.size() != 16) return false;
         mbedtls_rsa_set_padding(rsa, MBEDTLS_RSA_PKCS_V21, MBEDTLS_MD_SHA1);
         uint8_t key[32];
         size_t n = 0;
-        const bool unwrapped = mbedtls_rsa_rsaes_oaep_decrypt(rsa, rng, nullptr, MBEDTLS_RSA_PRIVATE, nullptr, 0, &n, w.data(), key, sizeof key) == 0 && n == 16;
-        mbedtls_platform_zeroize(key, sizeof key);   // (step 1 keeps no key: it only checks)
-        if (!unwrapped) return false;
+        if (mbedtls_rsa_rsaes_oaep_decrypt(rsa, rng, nullptr, MBEDTLS_RSA_PRIVATE, nullptr, 0, &n, w.data(), key, sizeof key) != 0 || n != 16) return false;
+        mbedtls_aes_setkey_dec(&aes, key, 128);
+        mbedtls_platform_zeroize(key, sizeof key);
+        memcpy(iv, i.data(), 16);
+        haveAes = true;
         unsigned pt, fp, compat, bits, pb, mb, kb, ch, run, maxBytes, avg, rate;
-        if (sscanf(lineOf(body, "a=fmtp:").c_str(), "%u %u %u %u %u %u %u %u %u %u %u %u", &pt, &fp, &compat, &bits, &pb, &mb, &kb, &ch, &run, &maxBytes, &avg, &rate) != 12) return false;
-        return fp >= 1 && fp <= 4096 && bits == 16 && ch == 2 && rate == 44100;
+        if (sscanf(lineOf(body, "a=fmtp:").c_str(), "%u %u %u %u %u %u %u %u %u %u %u %u", &pt, &fp, &compat, &bits, &pb, &mb, &kb, &ch, &run, &maxBytes, &avg, &rate) != 12) { endStream(); return false; }
+        if (fp < 1 || fp > alac::Decoder::kMaxFrame || bits != 16 || ch != 2 || rate != 44100) { endStream(); return false; }
+        alac::Config cfg;
+        cfg.frameLength = fp;
+        cfg.bitDepth = uint8_t(bits);
+        cfg.pb = uint8_t(pb);
+        cfg.mb = uint8_t(mb);
+        cfg.kb = uint8_t(kb);
+        cfg.channels = uint8_t(ch);
+        cfg.maxRun = uint16_t(run);
+        dec = new (std::nothrow) alac::Decoder;
+        slots = new (std::nothrow) Slot[kSlots];
+        if (!dec || !slots || !dec->init(cfg)) { lg("stream setup failed (memory or format)"); endStream(); return false; }
+        haveNext = haveControl = decodedOnce = false;
+        lost = repaired = decodeErrors = 0;
+        return true;
+    }
+
+    /** The stream is over (or replaced): the sound stops, what it held is freed, the music player plays on if it was playing. */
+    void endStream() {
+        audio.stop();
+        delete[] slots;
+        slots = nullptr;
+        delete dec;
+        dec = nullptr;
+        mbedtls_aes_free(&aes);
+        mbedtls_aes_init(&aes);
+        haveAes = haveNext = haveControl = false;
+        streamConn = nullptr;
+        clientIp = 0;
+        if (bgWasPlaying) { bgWasPlaying = false; bgResume(); lg("background player resumed"); }
+    }
+
+    // ---- the packets: put in order (some come late, some not at all), decrypted, decoded, resampled into the sound's ring
+
+    void decodePacket(uint8_t* p, int size) {
+        if (!dec || !haveAes || size <= 12) return;
+        uint8_t* data = p + 12;   // after the RTP header
+        const size_t n = size_t(size - 12), whole = n & ~size_t(15);   // (only whole blocks of 16 are encrypted)
+        uint8_t v[16];
+        memcpy(v, iv, 16);       // (every packet starts from the same vector)
+        if (whole) mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, whole, v, data, data);
+        const int frames = dec->decode(data, n, pcm);
+        if (frames > 0) {
+            if (!decodedOnce) { decodedOnce = true; lg("first audio decoded: %d frames in a packet", frames); }
+            audio.push44(pcm, frames);
+        } else if (++decodeErrors <= 3) {
+            lg("a packet could not be decoded (%d bytes)", size);
+        }
+    }
+
+    void take(const uint8_t* p, int n, double now, bool retransmit) {
+        if (!slots || n <= 12 || n > kPacket) return;
+        const uint16_t seq = uint16_t(p[2] << 8 | p[3]);
+        if (!haveNext) { haveNext = true; nextSeq = topSeq = seq; }
+        const int ahead = int16_t(seq - nextSeq);
+        if (ahead < 0) return;                                   // already played (or given up on)
+        if (ahead >= kSlots) { flushTo(seq); }                   // too far ahead: start again from here
+        if (int16_t(seq - topSeq) > 0) {                         // newer than any so far: the ones between are missing
+            for (uint16_t s = uint16_t(topSeq + 1); s != seq; s++) { Slot& g = slots[s % kSlots]; g.have = false; g.asked = false; g.waitingSince = now; }
+            topSeq = seq;
+        }
+        Slot& s = slots[seq % kSlots];
+        s.have = true;
+        s.size = n;
+        memcpy(s.data, p, size_t(n));
+        if (retransmit) repaired++;
+    }
+
+    void flushTo(uint16_t seq) {
+        for (int i = 0; i < kSlots; i++) slots[i].have = false;
+        nextSeq = topSeq = seq;
+    }
+
+    void drain(double now) {
+        if (!slots || !haveNext) return;
+        for (int budget = 64; budget > 0 && int16_t(topSeq - nextSeq) >= 0; budget--) {   // (a bounded bite: the loop stays quick)
+            Slot& s = slots[nextSeq % kSlots];
+            if (s.have) {
+                decodePacket(s.data, s.size);
+                s.have = false;
+                nextSeq++;
+                continue;
+            }
+            const double waited = now - s.waitingSince;
+            if (waited > kGiveUpAfter) {   // not coming: this much silence, to keep the rest in time
+                audio.pushSilence(383);
+                lost++;
+                nextSeq++;
+                continue;
+            }
+            if (waited > kAskAfter && !s.asked && haveControl && media[1] >= 0) {
+                s.asked = true;
+                const uint8_t ask[8] = { 0x80, 0xD5, 0, 1, uint8_t(nextSeq >> 8), uint8_t(nextSeq), 0, 1 };   // "send packet nextSeq again"
+                sendto(media[1], ask, sizeof ask, 0, reinterpret_cast<sockaddr*>(&control), sizeof control);
+            }
+            break;
+        }
     }
 
     void send(Conn& c, const std::string& s) {
@@ -443,9 +587,13 @@ struct Receiver {
     void hangUp(Conn& c) {
         closeFd(c.fd);
         c.in.clear();
-        if (streaming) lg("stream ended (%lu packets)", packets);
-        streaming = false;
-        packets = packetsAtLog = 0;
+        c.skip = 0;
+        if (&c == streamConn) {
+            if (streaming) lg("stream ended (%lu packets, %u lost, %u repaired, %u underruns, %u dropped, %u decode errors)", packets, lost, repaired, audio.underruns(), audio.dropped(), decodeErrors);
+            endStream();
+            streaming = false;
+            packets = packetsAtLog = 0;
+        }
     }
 
     void onRequest(Conn& c, const std::string& head, const std::string& body) {
@@ -466,29 +614,53 @@ struct Receiver {
         } else if (method == "ANNOUNCE") {
             // Step 1 has no "ask" question and no allowed list: any device on the network is let through, which is fine for a test but not
             // for use (step 3 brings the app's allowed devices over).
-            if (!playable(body)) {
+            streaming = false;
+            packets = packetsAtLog = 0;
+            if (!setupStream(body)) {
                 lg("ANNOUNCE refused: not a stream this receiver can play");
                 reply = "RTSP/1.0 400 Bad Request\r\nServer: AirTunes/105.1\r\nCSeq:" + cseq + "\r\n";
             } else {
                 std::string name = lineOf(body, "i=");
                 for (char& ch : name) if (uint8_t(ch) < 0x20) ch = ' ';
                 lg("ANNOUNCE from \"%s\"", name.substr(0, 64).c_str());
-                streaming = false;
-                packets = packetsAtLog = 0;
+                streamConn = &c;
+                clientIp = c.peer;
             }
         } else if (method == "SETUP") {
+            const size_t cp = head.find("control_port=");
+            if (cp != std::string::npos && &c == streamConn) {
+                const int port = atoi(head.c_str() + cp + 13);
+                if (port > 0 && port < 65536) {
+                    control = sockaddr_in{};
+                    control.sin_family = AF_INET;
+                    control.sin_port = htons(uint16_t(port));
+                    control.sin_addr.s_addr = c.peer;
+                    haveControl = true;
+                }
+            }
             char t[140];
             snprintf(t, sizeof t, "Session: 1\r\nAudio-Jack-Status: connected\r\nTransport: RTP/AVP/UDP;unicast;mode=record;server_port=%d;control_port=%d;timing_port=%d\r\n", kAudio, kControl, kTiming);
             reply += t;
             lg("SETUP");
         } else if (method == "RECORD") {
             reply += "Audio-Latency: 11025\r\nSession: 1\r\n";
-            streaming = true;
-            packets = packetsAtLog = 0;
-            lastStreamLog = tickSeconds();
-            lg("RECORD: streaming (audio is counted and dropped in this step)");
+            if (&c != streamConn || !dec) {
+                lg("RECORD refused: no stream was announced");
+                reply = "RTSP/1.0 455 Method Not Valid in This State\r\nServer: AirTunes/105.1\r\nCSeq:" + cseq + "\r\n";
+            } else {
+                streaming = true;
+                packets = packetsAtLog = 0;
+                lastStreamLog = tickSeconds();
+                audio.setGain(gain);
+                if (!audio.start()) lg("RECORD: the sound could not be started (memory or thread)");
+                if (!bgWasPlaying && (bgWasPlaying = bgPause())) lg("background player paused");
+                lg("RECORD: streaming");
+            }
         } else if (method == "FLUSH") {
             lg("FLUSH");
+            audio.flush();
+            haveNext = false;
+            if (slots) for (int i = 0; i < kSlots; i++) slots[i].have = false;
         } else if (method == "TEARDOWN") {
             lg("TEARDOWN");
             send(c, reply + "\r\n");
@@ -498,7 +670,12 @@ struct Receiver {
             const std::string type = lineOf(head, "Content-Type:");
             if (type.find("text/parameters") != std::string::npos) {
                 const std::string v = lineOf(body, "volume:");
-                if (!v.empty()) lg("volume %s dB", v.c_str());
+                if (!v.empty()) {
+                    const float db = float(atof(v.c_str()));
+                    gain = db <= -30.f ? 0.f : std::pow(10.f, std::min(db, 0.f) / 20.f);   // (-144 is the iPhone's mute)
+                    audio.setGain(gain);
+                    lg("volume %s dB", v.c_str());
+                }
             }
         } else if (method != "GET_PARAMETER" && method != "PAUSE") {
             reply = "RTSP/1.0 404 Not Found\r\nServer: AirTunes/105.1\r\nCSeq:" + cseq + "\r\n";
@@ -535,7 +712,10 @@ struct Receiver {
         for (;;) {
             const ssize_t n = recv(c.fd, buf, sizeof buf, 0);
             if (n > 0) {
-                c.in.append(buf, size_t(n));
+                const char* data = buf;
+                size_t k = size_t(n);
+                if (c.skip) { const size_t d = std::min(c.skip, k); c.skip -= d; data += d; k -= d; }   // (the rest of a body not kept)
+                c.in.append(data, k);
                 if (c.in.size() > kMaxHead + kMaxBody) { lg("request too big: dropped"); hangUp(c); return; }
             } else if (n == 0) { lg("peer closed the connection (%zu bytes unread)", c.in.size()); hangUp(c); return; }
             else if (wouldBlock()) break;
@@ -553,7 +733,17 @@ struct Receiver {
             if (end > kMaxHead) { hangUp(c); return; }
             const std::string head = c.in.substr(0, end);
             const long want = atol(lineOf(head, "Content-Length:").c_str());
-            if (want < 0 || size_t(want) > kMaxBody) { lg("body too big: dropped"); hangUp(c); return; }
+            if (want < 0) { hangUp(c); return; }
+            if (size_t(want) > kMaxBody) {
+                if (head.compare(0, 13, "SET_PARAMETER") != 0) { lg("body too big: dropped"); hangUp(c); return; }
+                // a cover, too big to keep: the request is answered now, its bytes are thrown away as they come
+                const size_t have = c.in.size() - (end + 4), eat = std::min(have, size_t(want));
+                c.in.erase(0, end + 4 + eat);
+                c.skip = size_t(want) - eat;
+                onRequest(c, head, std::string());
+                if (c.fd < 0) return;
+                continue;
+            }
             if (c.in.size() < end + 4 + size_t(want)) return;
             const std::string body = c.in.substr(end + 4, size_t(want));
             c.in.erase(0, end + 4 + size_t(want));
@@ -564,13 +754,22 @@ struct Receiver {
 
     void drainMedia() {
         uint8_t d[2048];
-        for (int i = 0; i < 3; i++) {
-            for (int k = 0; k < 64; k++) {   // a bounded bite per turn
-                const ssize_t n = recv(media[i], d, sizeof d, 0);
-                if (n <= 0) break;
-                if (i == 0 && streaming) packets++;
-            }
+        const double now = tickSeconds();
+        for (int k = 0; k < 96; k++) {   // the audio: only from the device that plays, a bounded bite per turn
+            sockaddr_in src{};
+            socklen_t len = sizeof src;
+            const ssize_t n = recvfrom(media[0], d, sizeof d, 0, reinterpret_cast<sockaddr*>(&src), &len);
+            if (n <= 0) break;
+            if (streaming && src.sin_addr.s_addr == clientIp && n > 12 && (d[1] & 0x7f) == 0x60) { packets++; take(d, int(n), now, false); }
         }
+        for (int k = 0; k < 32; k++) {   // the control port: packets sent again (type 0x56, the packet 4 bytes in); its sync packets are not used yet
+            sockaddr_in src{};
+            socklen_t len = sizeof src;
+            const ssize_t n = recvfrom(media[1], d, sizeof d, 0, reinterpret_cast<sockaddr*>(&src), &len);
+            if (n <= 0) break;
+            if (streaming && src.sin_addr.s_addr == clientIp && n > 16 && (d[1] & 0x7f) == 0x56) take(d + 4, int(n) - 4, now, true);
+        }
+        for (int k = 0; k < 8; k++) if (recv(media[2], d, sizeof d, 0) <= 0) break;   // timing: nothing asked of it yet
     }
 
     void pump() {
@@ -579,8 +778,10 @@ struct Receiver {
         for (Conn& c : conns) if (c.fd >= 0) pumpConn(c);
         drainMedia();
         const double now = tickSeconds();
+        if (streaming) drain(now);
         if (streaming && now - lastStreamLog >= 5) {
-            lg("streaming: %lu packets (+%lu in 5 s)", packets, packets - packetsAtLog);
+            lg("streaming: %lu packets (+%lu in 5 s), %u ms queued, %u lost, %u repaired, %u underruns, %u dropped, sound %s", packets, packets - packetsAtLog, audio.fill() / 48, lost, repaired,
+               audio.underruns(), audio.dropped(), audio.opened() ? "open" : audio.openFailures() ? "NOT OPEN" : "not started");
             packetsAtLog = packets;
             lastStreamLog = now;
         }
@@ -595,7 +796,7 @@ struct Receiver {
 int main(int, char**) {
     mkdir("sdmc:/config", 0777);
     mkdir("sdmc:/config/songate-nx", 0777);
-    lg("---- airplay-bg step 1 starting (build %s %s, build 4: sleep/wake recovery)", __DATE__, __TIME__);
+    lg("---- airplay-bg step 2 starting (build %s %s, build 5: sound)", __DATE__, __TIME__);
 
     // Small buffers: the default config's are sized for a game. Fields set by name, so the struct's order does not matter.
     SocketInitConfig cfg = *socketGetDefaultInitConfig();
