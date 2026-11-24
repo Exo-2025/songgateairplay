@@ -668,7 +668,24 @@ struct Receiver {
             return;
         } else if (method == "SET_PARAMETER") {
             const std::string type = lineOf(head, "Content-Type:");
+            lg("metadata request: type=%s bytes=%zu declared=%s", type.substr(0, 80).c_str(), body.size(), lineOf(head, "Content-Length:").substr(0, 20).c_str());
+            if (type.find("dmap") != std::string::npos) {
+                auto tag = [&](const char* t) {
+                    const size_t at = body.find(t);
+                    if (at == std::string::npos || body.size() - at < 8) return std::string();
+                    const size_t n = size_t(uint8_t(body[at+4])) << 24 | size_t(uint8_t(body[at+5])) << 16 | size_t(uint8_t(body[at+6])) << 8 | uint8_t(body[at+7]);
+                    if (n > 256 || n > body.size() - at - 8) return std::string();
+                    std::string v = body.substr(at+8, n);
+                    for (char& ch : v) if (uint8_t(ch) < 32) ch = ' ';
+                    return v;
+                };
+                lg("track: title=%s artist=%s album=%s", tag("minm").c_str(), tag("asar").c_str(), tag("asal").c_str());
+            }
             if (type.find("text/parameters") != std::string::npos) {
+                unsigned start=0, current=0, end=0;
+                if (sscanf(lineOf(body, "progress:").c_str(), " %u/%u/%u", &start, &current, &end) == 3)
+                    lg("progress: %.2f / %.2f seconds", double(uint32_t(current-start))/44100.0, double(uint32_t(end-start))/44100.0);
+
                 const std::string v = lineOf(body, "volume:");
                 if (!v.empty()) {
                     const float db = float(atof(v.c_str()));
@@ -796,7 +813,7 @@ struct Receiver {
 int main(int, char**) {
     mkdir("sdmc:/config", 0777);
     mkdir("sdmc:/config/songate-nx", 0777);
-    lg("---- airplay-bg step 2 starting (build %s %s, build 5: sound)", __DATE__, __TIME__);
+    lg("---- airplay-bg step 2 starting (build %s %s, build 6a: metadata diagnostics)", __DATE__, __TIME__);
 
     // Small buffers: the default config's are sized for a game. Fields set by name, so the struct's order does not matter.
     SocketInitConfig cfg = *socketGetDefaultInitConfig();
