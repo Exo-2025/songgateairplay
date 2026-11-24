@@ -424,7 +424,7 @@ struct Receiver {
             int err=0; socklen_t len=sizeof err; if(getsockopt(dacpFd,SOL_SOCKET,SO_ERROR,&err,&len)<0||err){lg("DACP: connection failed errno=%d",err?err:errno);stopDacp();return;} dacpStage=2;
         }
         if(dacpStage==2) {
-            int n=send(dacpFd,dacpRequest.data()+dacpSent,dacpRequest.size()-dacpSent,0);
+            int n=::send(dacpFd,dacpRequest.data()+dacpSent,dacpRequest.size()-dacpSent,0);
             if(n<0){if(!wouldBlock())stopDacp();return;} dacpSent+=n; if(dacpSent==dacpRequest.size())dacpStage=3;
         }
         if(dacpStage==3) {
