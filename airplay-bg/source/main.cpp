@@ -217,6 +217,10 @@ struct Receiver {
     double metaRetry = 0;
     bool metaSlot = false;
     bool awaitingProgress = false;
+    double lastMediaAt = 0;
+    bool mediaClockHeld = false;
+    static constexpr double pauseGrace = 60.0;
+    static constexpr double mediaIdle = 0.75;
     uint64_t artHash = 0;
     std::string coverPath;
     void freezeClock() {
@@ -224,7 +228,7 @@ struct Receiver {
         metaPlaying = false; metaAnchor = tickSeconds();
     }
     void clearPresentation() {
-        graceUntil = 0; metaPlaying = false; metaAnchor = 0; awaitingProgress = false;
+        lastMediaAt = 0; mediaClockHeld = false; graceUntil = 0; metaPlaying = false; metaAnchor = 0; awaitingProgress = false;
         metaTitle.clear(); metaArtist.clear(); metaAlbum.clear(); metaPosition = metaDuration = 0;
         if (!coverPath.empty()) remove(coverPath.c_str());
         coverPath.clear(); artHash = 0; publishMeta(false);
@@ -651,7 +655,7 @@ struct Receiver {
         c.skip = 0;
         if (&c == streamConn) {
             if (streaming) lg("stream ended (%lu packets, %u lost, %u repaired, %u underruns, %u dropped, %u decode errors)", packets, lost, repaired, audio.underruns(), audio.dropped(), decodeErrors);
-            if (streaming && metaActive) { freezeClock(); graceUntil = tickSeconds() + 30; publishMeta(true); lg("presentation held for 30 seconds"); endStream(true); }
+            if (streaming && metaActive) { freezeClock(); graceUntil = tickSeconds() + pauseGrace; publishMeta(true); lg("presentation held for 60 seconds"); endStream(true); }
             else endStream(graceUntil > tickSeconds());
             streaming = false;
             packets = packetsAtLog = 0;
@@ -711,6 +715,7 @@ struct Receiver {
                 reply = "RTSP/1.0 455 Method Not Valid in This State\r\nServer: AirTunes/105.1\r\nCSeq:" + cseq + "\r\n";
             } else {
                 streaming = true;
+                lastMediaAt = 0; mediaClockHeld = false;
                 graceUntil = 0; awaitingProgress = true; metaPlaying = false; metaAnchor = tickSeconds();
                 publishMeta(true);
                 packets = packetsAtLog = 0;
@@ -721,7 +726,7 @@ struct Receiver {
                 lg("RECORD: streaming");
             }
         } else if (method == "PAUSE") {
-            if (&c == streamConn) { awaitingProgress = false; freezeClock(); publishMeta(true); }
+            if (&c == streamConn) { awaitingProgress = false; mediaClockHeld = false; freezeClock(); publishMeta(true); }
         } else if (method == "FLUSH") {
             lg("FLUSH");
             audio.flush();
@@ -763,7 +768,7 @@ struct Receiver {
             if (type.find("text/parameters") != std::string::npos) {
                 unsigned start=0, current=0, end=0;
                 if (sscanf(lineOf(body, "progress:").c_str(), " %u/%u/%u", &start, &current, &end) == 3) {
-                    if (&c == streamConn) { metaPosition = double(uint32_t(current-start))/44100.0; metaDuration = double(uint32_t(end-start))/44100.0; metaAnchor = tickSeconds(); if (awaitingProgress) { metaPlaying = streaming; awaitingProgress = false; } publishMeta(metaActive); }
+                    if (&c == streamConn) { metaPosition = double(uint32_t(current-start))/44100.0; metaDuration = double(uint32_t(end-start))/44100.0; metaAnchor = tickSeconds(); if (mediaClockHeld) { mediaClockHeld = false; metaPlaying = streaming; } if (awaitingProgress) { metaPlaying = streaming; awaitingProgress = false; } publishMeta(metaActive); }
                     lg("progress: %.2f / %.2f seconds", double(uint32_t(current-start))/44100.0, double(uint32_t(end-start))/44100.0);
                 }
 
@@ -865,7 +870,7 @@ struct Receiver {
             socklen_t len = sizeof src;
             const ssize_t n = recvfrom(media[0], d, sizeof d, 0, reinterpret_cast<sockaddr*>(&src), &len);
             if (n <= 0) break;
-            if (streaming && src.sin_addr.s_addr == clientIp && n > 12 && (d[1] & 0x7f) == 0x60) { packets++; take(d, int(n), now, false); }
+            if (streaming && src.sin_addr.s_addr == clientIp && n > 12 && (d[1] & 0x7f) == 0x60) { lastMediaAt = now; packets++; take(d, int(n), now, false); }
         }
         for (int k = 0; k < 32; k++) {   // the control port: packets sent again (type 0x56, the packet 4 bytes in); its sync packets are not used yet
             sockaddr_in src{};
@@ -888,6 +893,15 @@ struct Receiver {
         }
         drainMedia();
         const double now = tickSeconds();
+        // A short RTP gap can precede TEARDOWN. Hold only the presentation clock.
+        if (streaming && metaActive && metaPlaying && lastMediaAt > 0 && now - lastMediaAt >= mediaIdle) {
+            metaPosition = std::min(metaDuration, metaPosition + std::max(0.0, lastMediaAt - metaAnchor));
+            metaAnchor = now; metaPlaying = false; mediaClockHeld = true;
+            publishMeta(true); lg("presentation clock held: RTP idle");
+        } else if (streaming && mediaClockHeld && lastMediaAt > 0 && now - lastMediaAt < mediaIdle) {
+            metaAnchor = now; metaPlaying = true; mediaClockHeld = false;
+            publishMeta(true); lg("presentation clock resumed: RTP active");
+        }
         if (graceUntil && now >= graceUntil) { lg("presentation grace expired"); clearPresentation(); }
         if (metaDirty && now >= metaRetry) publishMeta(metaActive);
         if (streaming) drain(now);
@@ -908,7 +922,7 @@ struct Receiver {
 int main(int, char**) {
     mkdir("sdmc:/config", 0777);
     mkdir("sdmc:/config/songate-nx", 0777);
-    lg("---- airplay-bg step 2 starting (build %s %s, build 6e: clock resync and bounded RTSP reads)", __DATE__, __TIME__);
+    lg("---- airplay-bg step 2 starting (build %s %s, build 6f: 60-second grace and RTP clock hold)", __DATE__, __TIME__);
 
     // Small buffers: the default config's are sized for a game. Fields set by name, so the struct's order does not matter.
     SocketInitConfig cfg = *socketGetDefaultInitConfig();
