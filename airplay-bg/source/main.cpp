@@ -187,6 +187,7 @@ struct Conn {
     double since = 0;
     FILE* cover = nullptr;
     size_t coverBytes = 0;
+    uint64_t coverHash = 14695981039346656037ULL;
     size_t skip = 0;   // bytes of a body too big to keep still to come: thrown away
 };
 
@@ -211,29 +212,53 @@ void bgResume() {
 
 struct Receiver {
     std::string metaTitle, metaArtist, metaAlbum;
-    double metaPosition = 0, metaDuration = 0;
+    double metaPosition = 0, metaDuration = 0, metaAnchor = 0, graceUntil = 0;
+    bool metaPlaying = false, metaDirty = false, metaActive = false;
+    double metaRetry = 0;
+    uint64_t artHash = 0;
+    std::string coverPath;
+    void freezeClock() {
+        if (metaPlaying && metaAnchor > 0) metaPosition = std::min(metaDuration, metaPosition + std::max(0.0, tickSeconds()-metaAnchor));
+        metaPlaying = false; metaAnchor = tickSeconds();
+    }
+    void clearPresentation() {
+        graceUntil = 0; metaPlaying = false; metaAnchor = 0;
+        metaTitle.clear(); metaArtist.clear(); metaAlbum.clear(); metaPosition = metaDuration = 0;
+        if (!coverPath.empty()) remove(coverPath.c_str());
+        coverPath.clear(); artHash = 0; publishMeta(false);
+        if (bgWasPlaying) { bgWasPlaying = false; bgResume(); lg("background player resumed"); }
+    }
     void publishMeta(bool active) {
+        metaActive = active; metaDirty = true; metaRetry = tickSeconds() + 0.5;
         FILE* f = fopen(metaTmp, "wb");
         if (!f) { lg("metadata state open failed errno=%d", errno); return; }
-        const int n = fprintf(f, "%d\n%.3f\n%.3f\n%s\n%s\n%s\n", int(active), metaPosition, metaDuration, metaTitle.c_str(), metaArtist.c_str(), metaAlbum.c_str());
+        const int n = fprintf(f, "%d\n%.3f\n%.3f\n%s\n%s\n%s\n%d\n%.6f\n%s\n", int(active), metaPosition, metaDuration, metaTitle.c_str(), metaArtist.c_str(), metaAlbum.c_str(), int(metaPlaying), metaAnchor, coverPath.c_str());
         const int writeErr = n < 0 ? errno : 0;
         const int rc = fclose(f);
         if (n < 0 || rc) { lg("metadata state write/close failed n=%d rc=%d errno=%d", n, rc, n < 0 ? writeErr : errno); remove(metaTmp); return; }
         // libnx SD filesystem rename may not replace an existing destination.
         if (remove(metaPath) && errno != ENOENT) { lg("metadata state remove failed errno=%d", errno); return; }
         if (rename(metaTmp, metaPath)) { lg("metadata state rename failed errno=%d", errno); return; }
+        metaDirty = false;
         lg("metadata state saved: active=%d bytes=%d", int(active), n);
     }
     void coverChunk(Conn& c, const char* data, size_t n) {
         if (!c.cover) return;
         if (fwrite(data, 1, n, c.cover) != n) { fclose(c.cover); c.cover = nullptr; remove(artTmp); lg("artwork write failed"); return; }
+        for (size_t i=0; i<n; ++i) { c.coverHash ^= uint8_t(data[i]); c.coverHash *= 1099511628211ULL; }
         c.coverBytes += n;
     }
     void finishCover(Conn& c) {
         if (!c.cover) return;
         const int rc = fclose(c.cover); c.cover = nullptr;
-        if (!rc && !rename(artTmp, artPath)) lg("artwork saved: %zu bytes", c.coverBytes);
-        else { remove(artTmp); lg("artwork commit failed"); }
+        if (rc || !c.coverBytes) { remove(artTmp); lg("artwork close failed"); return; }
+        if (c.coverHash == artHash && !coverPath.empty()) { remove(artTmp); lg("artwork unchanged"); return; }
+        // Alternate filenames so the overlay never reads the file being written.
+        const std::string next = coverPath == std::string(artPath) ? "sdmc:/config/songate-nx/airplay-cover-b.jpg" : artPath;
+        if (remove(next.c_str()) && errno != ENOENT) { remove(artTmp); lg("artwork remove failed errno=%d", errno); return; }
+        if (rename(artTmp, next.c_str())) { lg("artwork commit failed errno=%d", errno); remove(artTmp); return; }
+        coverPath = next; artHash = c.coverHash;
+        lg("artwork saved: %zu bytes", c.coverBytes); publishMeta(metaActive);
     }
 
     // sockets
@@ -492,7 +517,7 @@ struct Receiver {
 
     /** An ANNOUNCE: takes the stream's AES key out of its wrapping, checks its format (44.1 kHz stereo 16-bit ALAC) and gets ready for it. */
     bool setupStream(const std::string& body) {
-        endStream();
+        endStream(graceUntil > tickSeconds());
         if (!rsa) return false;
         const std::vector<uint8_t> w = unbase64(lineOf(body, "a=rsaaeskey:")), i = unbase64(lineOf(body, "a=aesiv:"));
         if (w.size() != mbedtls_rsa_get_len(rsa) || i.size() != 16) return false;
@@ -524,10 +549,8 @@ struct Receiver {
     }
 
     /** The stream is over (or replaced): the sound stops, what it held is freed, the music player plays on if it was playing. */
-    void endStream() {
-        metaTitle.clear(); metaArtist.clear(); metaAlbum.clear();
-        metaPosition = metaDuration = 0;
-        remove(artPath); publishMeta(false);
+    void endStream(bool preserve = false) {
+        if (!preserve) clearPresentation();
         audio.stop();
         delete[] slots;
         slots = nullptr;
@@ -538,7 +561,6 @@ struct Receiver {
         haveAes = haveNext = haveControl = false;
         streamConn = nullptr;
         clientIp = 0;
-        if (bgWasPlaying) { bgWasPlaying = false; bgResume(); lg("background player resumed"); }
     }
 
     // ---- the packets: put in order (some come late, some not at all), decrypted, decoded, resampled into the sound's ring
@@ -626,7 +648,8 @@ struct Receiver {
         c.skip = 0;
         if (&c == streamConn) {
             if (streaming) lg("stream ended (%lu packets, %u lost, %u repaired, %u underruns, %u dropped, %u decode errors)", packets, lost, repaired, audio.underruns(), audio.dropped(), decodeErrors);
-            endStream();
+            if (streaming && metaActive) { freezeClock(); graceUntil = tickSeconds() + 30; publishMeta(true); lg("presentation held for 30 seconds"); endStream(true); }
+            else endStream(graceUntil > tickSeconds());
             streaming = false;
             packets = packetsAtLog = 0;
         }
@@ -685,6 +708,7 @@ struct Receiver {
                 reply = "RTSP/1.0 455 Method Not Valid in This State\r\nServer: AirTunes/105.1\r\nCSeq:" + cseq + "\r\n";
             } else {
                 streaming = true;
+                graceUntil = 0; metaPlaying = true; metaAnchor = tickSeconds();
                 publishMeta(true);
                 packets = packetsAtLog = 0;
                 lastStreamLog = tickSeconds();
@@ -693,6 +717,8 @@ struct Receiver {
                 if (!bgWasPlaying && (bgWasPlaying = bgPause())) lg("background player paused");
                 lg("RECORD: streaming");
             }
+        } else if (method == "PAUSE") {
+            if (&c == streamConn) { freezeClock(); publishMeta(true); }
         } else if (method == "FLUSH") {
             lg("FLUSH");
             audio.flush();
@@ -706,9 +732,9 @@ struct Receiver {
         } else if (method == "SET_PARAMETER") {
             const std::string type = lineOf(head, "Content-Type:");
             lg("metadata request: type=%s bytes=%zu declared=%s", type.substr(0, 80).c_str(), body.size(), lineOf(head, "Content-Length:").substr(0, 20).c_str());
-            if (&c == streamConn && type.find("image/none") != std::string::npos) remove(artPath);
+            // image/none is commonly followed by the same JPEG on seeks; retain current cover.
             if (&c == streamConn && type.find("image/jpeg") != std::string::npos && !body.empty()) {
-                c.cover = fopen(artTmp, "wb"); c.coverBytes = 0;
+                c.cover = fopen(artTmp, "wb"); c.coverBytes = 0; c.coverHash = 14695981039346656037ULL;
                 coverChunk(c, body.data(), body.size()); finishCover(c);
             }
             if (type.find("dmap") != std::string::npos) {
@@ -726,14 +752,14 @@ struct Receiver {
                     if (!title.empty()) metaTitle = title;
                     if (!artist.empty()) metaArtist = artist;
                     if (!album.empty()) metaAlbum = album;
-                    publishMeta(streaming);
+                    publishMeta(metaActive);
                 }
                 lg("track: title=%s artist=%s album=%s", tag("minm").c_str(), tag("asar").c_str(), tag("asal").c_str());
             }
             if (type.find("text/parameters") != std::string::npos) {
                 unsigned start=0, current=0, end=0;
                 if (sscanf(lineOf(body, "progress:").c_str(), " %u/%u/%u", &start, &current, &end) == 3) {
-                    if (&c == streamConn) { metaPosition = double(uint32_t(current-start))/44100.0; metaDuration = double(uint32_t(end-start))/44100.0; publishMeta(streaming); }
+                    if (&c == streamConn) { metaPosition = double(uint32_t(current-start))/44100.0; metaDuration = double(uint32_t(end-start))/44100.0; metaAnchor = tickSeconds(); publishMeta(metaActive); }
                     lg("progress: %.2f / %.2f seconds", double(uint32_t(current-start))/44100.0, double(uint32_t(end-start))/44100.0);
                 }
 
@@ -808,7 +834,7 @@ struct Receiver {
                 // a cover, too big to keep: the request is answered now, its bytes are thrown away as they come
                 const size_t have = c.in.size() - (end + 4), eat = std::min(have, size_t(want));
                 if (&c == streamConn && lineOf(head, "Content-Type:").find("image/jpeg") != std::string::npos && want <= 2*1024*1024) {
-                    c.cover = fopen(artTmp, "wb"); c.coverBytes = 0;
+                    c.cover = fopen(artTmp, "wb"); c.coverBytes = 0; c.coverHash = 14695981039346656037ULL;
                     if (!c.cover) lg("artwork open failed");
                     coverChunk(c, c.in.data() + end + 4, eat);
                 }
@@ -853,6 +879,8 @@ struct Receiver {
         for (Conn& c : conns) if (c.fd >= 0) pumpConn(c);
         drainMedia();
         const double now = tickSeconds();
+        if (graceUntil && now >= graceUntil) { lg("presentation grace expired"); clearPresentation(); }
+        if (metaDirty && now >= metaRetry) publishMeta(metaActive);
         if (streaming) drain(now);
         if (streaming && now - lastStreamLog >= 5) {
             lg("streaming: %lu packets (+%lu in 5 s), %u ms queued, %u lost, %u repaired, %u underruns, %u dropped, sound %s", packets, packets - packetsAtLog, audio.fill() / 48, lost, repaired,
@@ -871,7 +899,7 @@ struct Receiver {
 int main(int, char**) {
     mkdir("sdmc:/config", 0777);
     mkdir("sdmc:/config/songate-nx", 0777);
-    lg("---- airplay-bg step 2 starting (build %s %s, build 6b1: state file fix)", __DATE__, __TIME__);
+    lg("---- airplay-bg step 2 starting (build %s %s, build 6d: presentation clock and artwork cache)", __DATE__, __TIME__);
 
     // Small buffers: the default config's are sized for a game. Fields set by name, so the struct's order does not matter.
     SocketInitConfig cfg = *socketGetDefaultInitConfig();
@@ -886,7 +914,7 @@ int main(int, char**) {
 
     static Receiver rx;
     rx.readConsoleName();
-    remove(artPath); remove(artTmp); rx.publishMeta(false);
+    remove(artPath); remove("sdmc:/config/songate-nx/airplay-cover-b.jpg"); remove(artTmp); rx.publishMeta(false);
 
     bool sockets = false;
     double lastTick = tickSeconds(), lastCheck = lastTick;
@@ -907,7 +935,7 @@ int main(int, char**) {
         if (rx.dirty && rx.open) { lg("network error seen: reopening everything"); rx.closeAll(false); }
         // Idle for a minute: the sockets are made new, quietly. A socket that a sleep or a Wi-Fi change left dead (no error to show it:
         // its multicast membership gone, say) is then back within a minute, whatever else went unseen.
-        if (rx.open && !rx.streaming && !rx.anyConn() && now - rx.openedAt >= 60) { rx.refreshes++; rx.quiet = true; rx.closeAll(false); }
+        if (rx.open && !rx.streaming && !rx.anyConn() && now - rx.openedAt >= 60 && !rx.graceUntil) { rx.refreshes++; rx.quiet = true; rx.closeAll(false); }
         if (woke && rx.open) { lg("woke from sleep (clock jumped): reopening"); rx.closeAll(false); }
 
         if (!sockets) {

@@ -18,7 +18,7 @@ class StatusBar final : public tsl::elm::Element {
     u64 m_air_poll = 0, m_air_art_poll = 0;
     u64 m_air_hash = 0;
     unsigned m_air_misses = 0;
-    std::string m_air_album;
+    std::string m_air_album, m_air_cover;
     bool updateAirplay();
     void updateAirplayArt();
     bool m_playing = false;

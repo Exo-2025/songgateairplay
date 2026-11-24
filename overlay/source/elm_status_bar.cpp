@@ -1211,7 +1211,7 @@ bool StatusBar::updateAirplay() {
     if (m_air_poll && now - m_air_poll < 250000000ULL) return m_airplay;
     m_air_poll = now;
     FILE* f = fopen("sdmc:/config/songate-nx/airplay-state.txt", "rb");
-    std::string lines[6];
+    std::string lines[9];
     bool valid = f != nullptr;
     if (f) {
         char buf[2048];
@@ -1224,7 +1224,7 @@ bool StatusBar::updateAirplay() {
         }
         fclose(f);
     }
-    if (!valid && m_airplay && ++m_air_misses < 4) return true;
+    if (!valid && m_airplay && ++m_air_misses < 12) return true;
     if (valid) m_air_misses = 0;
     if (!valid || lines[0] != "1") {
         if (m_airplay) {
@@ -1240,8 +1240,9 @@ bool StatusBar::updateAirplay() {
     double pos = strtod(lines[1].c_str(), &end1), dur = strtod(lines[2].c_str(), &end2);
     if (lines[1].empty() || lines[2].empty() || *end1 || *end2 || !std::isfinite(pos) || !std::isfinite(dur) || dur < 0 || dur > 604800) return m_airplay;
     pos = std::clamp(pos, 0.0, dur);
+    if (!m_airplay) { m_art_valid = false; m_air_hash = 0; }
     if (!m_airplay || m_song_title_str != lines[3] || m_artist_str != lines[4] || m_air_album != lines[5]) {
-        m_art_valid = false; m_air_hash = 0; m_air_art_poll = 0;
+        m_air_art_poll = 0;
         m_text_width = m_artist_width = m_scroll_offset = m_artist_scroll_offset = 0;
         m_counter = m_artist_counter = 0;
     }
@@ -1250,6 +1251,10 @@ bool StatusBar::updateAirplay() {
     m_seeking = m_seek_engaged = m_ctrl_scrubbing = false;
     m_pending_seek_frame.store(UINT32_MAX, std::memory_order_release);
     m_stats = {}; m_playing = false;
+    const double anchor = strtod(lines[7].c_str(), nullptr);
+    const double clock = double(armTicksToNs(armGetSystemTick())) / 1e9;
+    if (lines[6] == "1" && anchor > 0 && clock >= anchor) pos = std::min(dur, pos + clock - anchor);
+    if (m_air_cover != lines[8]) { m_air_cover = lines[8]; m_air_art_poll = 0; }
     m_percentage = dur > 0 ? float(pos / dur) : 0;
     FmtClock(current_buffer, sizeof(current_buffer), static_cast<u32>(pos));
     FmtClock(total_buffer, sizeof(total_buffer), static_cast<u32>(dur));
@@ -1262,8 +1267,9 @@ bool StatusBar::updateAirplay() {
 void StatusBar::updateAirplayArt() {
     const s32 sz = ArtSize();
     if (sz <= 1 || sz > 512) return;
-    FILE* f = fopen("sdmc:/config/songate-nx/airplay-cover.jpg", "rb");
-    if (!f) { m_art_valid = false; m_air_hash = 0; return; }
+    if (m_air_cover.empty()) return;
+    FILE* f = fopen(m_air_cover.c_str(), "rb");
+    if (!f) return;
     // Hash compressed bytes, since all iPhone covers in tests had equal file sizes.
     u64 hash = 14695981039346656037ULL;
     unsigned char buf[4096]; size_t n, total = 0;
@@ -1276,11 +1282,11 @@ void StatusBar::updateAirplayArt() {
     if (m_art_valid && hash == m_air_hash && m_art_scaled_size == sz) { fclose(f); return; }
     rewind(f);
     int w = 0, h = 0, c = 0;
-    if (!stbi_info_from_file(f, &w, &h, &c) || w <= 0 || h <= 0 || w > 640 || h > 640) { fclose(f); m_art_valid = false; return; }
+    if (!stbi_info_from_file(f, &w, &h, &c) || w <= 0 || h <= 0 || w > 640 || h > 640) { fclose(f); return; }
     rewind(f);
     auto* pixels = stbi_load_from_file(f, &w, &h, &c, 3);
     fclose(f);
-    if (!pixels) { m_art_valid = false; return; }
+    if (!pixels) return;
     m_art_rgba4444.resize(size_t(sz) * sz * 2);
     toRGBA4444_from_RGB(pixels, w, h, sz, m_art_rgba4444.data());
     stbi_image_free(pixels);
