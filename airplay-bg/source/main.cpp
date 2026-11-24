@@ -214,10 +214,15 @@ struct Receiver {
     double metaPosition = 0, metaDuration = 0;
     void publishMeta(bool active) {
         FILE* f = fopen(metaTmp, "wb");
-        if (!f) { lg("metadata state open failed"); return; }
+        if (!f) { lg("metadata state open failed errno=%d", errno); return; }
         const int n = fprintf(f, "%d\n%.3f\n%.3f\n%s\n%s\n%s\n", int(active), metaPosition, metaDuration, metaTitle.c_str(), metaArtist.c_str(), metaAlbum.c_str());
+        const int writeErr = n < 0 ? errno : 0;
         const int rc = fclose(f);
-        if (n < 0 || rc || rename(metaTmp, metaPath)) lg("metadata state write failed");
+        if (n < 0 || rc) { lg("metadata state write/close failed n=%d rc=%d errno=%d", n, rc, n < 0 ? writeErr : errno); remove(metaTmp); return; }
+        // libnx SD filesystem rename may not replace an existing destination.
+        if (remove(metaPath) && errno != ENOENT) { lg("metadata state remove failed errno=%d", errno); return; }
+        if (rename(metaTmp, metaPath)) { lg("metadata state rename failed errno=%d", errno); return; }
+        lg("metadata state saved: active=%d bytes=%d", int(active), n);
     }
     void coverChunk(Conn& c, const char* data, size_t n) {
         if (!c.cover) return;
@@ -866,7 +871,7 @@ struct Receiver {
 int main(int, char**) {
     mkdir("sdmc:/config", 0777);
     mkdir("sdmc:/config/songate-nx", 0777);
-    lg("---- airplay-bg step 2 starting (build %s %s, build 6b: artwork storage)", __DATE__, __TIME__);
+    lg("---- airplay-bg step 2 starting (build %s %s, build 6b1: state file fix)", __DATE__, __TIME__);
 
     // Small buffers: the default config's are sized for a game. Fields set by name, so the struct's order does not matter.
     SocketInitConfig cfg = *socketGetDefaultInitConfig();
