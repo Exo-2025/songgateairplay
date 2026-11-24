@@ -176,11 +176,17 @@ bool wouldBlock() { return errno == EWOULDBLOCK || errno == EAGAIN; }
 
 // ---- the receiver -------------------------------------------------------------------------------------------------------------------
 
+constexpr const char* artPath = "sdmc:/config/songate-nx/airplay-cover.jpg";
+constexpr const char* artTmp = "sdmc:/config/songate-nx/airplay-cover.tmp";
+constexpr const char* metaPath = "sdmc:/config/songate-nx/airplay-state.txt";
+constexpr const char* metaTmp = "sdmc:/config/songate-nx/airplay-state.tmp";
 struct Conn {
     int fd = -1;
     uint32_t peer = 0;
     std::string in;
     double since = 0;
+    FILE* cover = nullptr;
+    size_t coverBytes = 0;
     size_t skip = 0;   // bytes of a body too big to keep still to come: thrown away
 };
 
@@ -204,6 +210,27 @@ void bgResume() {
 }
 
 struct Receiver {
+    std::string metaTitle, metaArtist, metaAlbum;
+    double metaPosition = 0, metaDuration = 0;
+    void publishMeta(bool active) {
+        FILE* f = fopen(metaTmp, "wb");
+        if (!f) { lg("metadata state open failed"); return; }
+        const int n = fprintf(f, "%d\n%.3f\n%.3f\n%s\n%s\n%s\n", int(active), metaPosition, metaDuration, metaTitle.c_str(), metaArtist.c_str(), metaAlbum.c_str());
+        const int rc = fclose(f);
+        if (n < 0 || rc || rename(metaTmp, metaPath)) lg("metadata state write failed");
+    }
+    void coverChunk(Conn& c, const char* data, size_t n) {
+        if (!c.cover) return;
+        if (fwrite(data, 1, n, c.cover) != n) { fclose(c.cover); c.cover = nullptr; remove(artTmp); lg("artwork write failed"); return; }
+        c.coverBytes += n;
+    }
+    void finishCover(Conn& c) {
+        if (!c.cover) return;
+        const int rc = fclose(c.cover); c.cover = nullptr;
+        if (!rc && !rename(artTmp, artPath)) lg("artwork saved: %zu bytes", c.coverBytes);
+        else { remove(artTmp); lg("artwork commit failed"); }
+    }
+
     // sockets
     int mdns = -1, listener = -1, media[3] = { -1, -1, -1 };
     Conn conns[2];
@@ -493,6 +520,9 @@ struct Receiver {
 
     /** The stream is over (or replaced): the sound stops, what it held is freed, the music player plays on if it was playing. */
     void endStream() {
+        metaTitle.clear(); metaArtist.clear(); metaAlbum.clear();
+        metaPosition = metaDuration = 0;
+        remove(artPath); publishMeta(false);
         audio.stop();
         delete[] slots;
         slots = nullptr;
@@ -585,6 +615,7 @@ struct Receiver {
     }
 
     void hangUp(Conn& c) {
+        if (c.cover) { fclose(c.cover); c.cover = nullptr; remove(artTmp); }
         closeFd(c.fd);
         c.in.clear();
         c.skip = 0;
@@ -649,6 +680,7 @@ struct Receiver {
                 reply = "RTSP/1.0 455 Method Not Valid in This State\r\nServer: AirTunes/105.1\r\nCSeq:" + cseq + "\r\n";
             } else {
                 streaming = true;
+                publishMeta(true);
                 packets = packetsAtLog = 0;
                 lastStreamLog = tickSeconds();
                 audio.setGain(gain);
@@ -669,6 +701,11 @@ struct Receiver {
         } else if (method == "SET_PARAMETER") {
             const std::string type = lineOf(head, "Content-Type:");
             lg("metadata request: type=%s bytes=%zu declared=%s", type.substr(0, 80).c_str(), body.size(), lineOf(head, "Content-Length:").substr(0, 20).c_str());
+            if (&c == streamConn && type.find("image/none") != std::string::npos) remove(artPath);
+            if (&c == streamConn && type.find("image/jpeg") != std::string::npos && !body.empty()) {
+                c.cover = fopen(artTmp, "wb"); c.coverBytes = 0;
+                coverChunk(c, body.data(), body.size()); finishCover(c);
+            }
             if (type.find("dmap") != std::string::npos) {
                 auto tag = [&](const char* t) {
                     const size_t at = body.find(t);
@@ -679,12 +716,21 @@ struct Receiver {
                     for (char& ch : v) if (uint8_t(ch) < 32) ch = ' ';
                     return v;
                 };
+                const auto title = tag("minm"), artist = tag("asar"), album = tag("asal");
+                if (&c == streamConn) {
+                    if (!title.empty()) metaTitle = title;
+                    if (!artist.empty()) metaArtist = artist;
+                    if (!album.empty()) metaAlbum = album;
+                    publishMeta(streaming);
+                }
                 lg("track: title=%s artist=%s album=%s", tag("minm").c_str(), tag("asar").c_str(), tag("asal").c_str());
             }
             if (type.find("text/parameters") != std::string::npos) {
                 unsigned start=0, current=0, end=0;
-                if (sscanf(lineOf(body, "progress:").c_str(), " %u/%u/%u", &start, &current, &end) == 3)
+                if (sscanf(lineOf(body, "progress:").c_str(), " %u/%u/%u", &start, &current, &end) == 3) {
+                    if (&c == streamConn) { metaPosition = double(uint32_t(current-start))/44100.0; metaDuration = double(uint32_t(end-start))/44100.0; publishMeta(streaming); }
                     lg("progress: %.2f / %.2f seconds", double(uint32_t(current-start))/44100.0, double(uint32_t(end-start))/44100.0);
+                }
 
                 const std::string v = lineOf(body, "volume:");
                 if (!v.empty()) {
@@ -731,9 +777,10 @@ struct Receiver {
             if (n > 0) {
                 const char* data = buf;
                 size_t k = size_t(n);
-                if (c.skip) { const size_t d = std::min(c.skip, k); c.skip -= d; data += d; k -= d; }   // (the rest of a body not kept)
+                if (c.skip) { const size_t d = std::min(c.skip, k); coverChunk(c, data, d); c.skip -= d; data += d; k -= d; if (!c.skip) finishCover(c); }   // (the rest of a body not kept)
                 c.in.append(data, k);
-                if (c.in.size() > kMaxHead + kMaxBody) { lg("request too big: dropped"); hangUp(c); return; }
+                if (c.in.size() > kMaxHead + kMaxBody + sizeof buf) { lg("request too big: dropped"); hangUp(c); return; }
+                break;
             } else if (n == 0) { lg("peer closed the connection (%zu bytes unread)", c.in.size()); hangUp(c); return; }
             else if (wouldBlock()) break;
             else {
@@ -755,8 +802,14 @@ struct Receiver {
                 if (head.compare(0, 13, "SET_PARAMETER") != 0) { lg("body too big: dropped"); hangUp(c); return; }
                 // a cover, too big to keep: the request is answered now, its bytes are thrown away as they come
                 const size_t have = c.in.size() - (end + 4), eat = std::min(have, size_t(want));
+                if (&c == streamConn && lineOf(head, "Content-Type:").find("image/jpeg") != std::string::npos && want <= 2*1024*1024) {
+                    c.cover = fopen(artTmp, "wb"); c.coverBytes = 0;
+                    if (!c.cover) lg("artwork open failed");
+                    coverChunk(c, c.in.data() + end + 4, eat);
+                }
                 c.in.erase(0, end + 4 + eat);
                 c.skip = size_t(want) - eat;
+                if (!c.skip) finishCover(c);
                 onRequest(c, head, std::string());
                 if (c.fd < 0) return;
                 continue;
@@ -813,7 +866,7 @@ struct Receiver {
 int main(int, char**) {
     mkdir("sdmc:/config", 0777);
     mkdir("sdmc:/config/songate-nx", 0777);
-    lg("---- airplay-bg step 2 starting (build %s %s, build 6a: metadata diagnostics)", __DATE__, __TIME__);
+    lg("---- airplay-bg step 2 starting (build %s %s, build 6b: artwork storage)", __DATE__, __TIME__);
 
     // Small buffers: the default config's are sized for a game. Fields set by name, so the struct's order does not matter.
     SocketInitConfig cfg = *socketGetDefaultInitConfig();
@@ -828,6 +881,7 @@ int main(int, char**) {
 
     static Receiver rx;
     rx.readConsoleName();
+    remove(artPath); remove(artTmp); rx.publishMeta(false);
 
     bool sockets = false;
     double lastTick = tickSeconds(), lastCheck = lastTick;
