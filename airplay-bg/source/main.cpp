@@ -215,6 +215,8 @@ struct Receiver {
     double metaPosition = 0, metaDuration = 0, metaAnchor = 0, graceUntil = 0;
     bool metaPlaying = false, metaDirty = false, metaActive = false;
     double metaRetry = 0;
+    bool metaSlot = false;
+    bool awaitingProgress = false;
     uint64_t artHash = 0;
     std::string coverPath;
     void freezeClock() {
@@ -222,7 +224,7 @@ struct Receiver {
         metaPlaying = false; metaAnchor = tickSeconds();
     }
     void clearPresentation() {
-        graceUntil = 0; metaPlaying = false; metaAnchor = 0;
+        graceUntil = 0; metaPlaying = false; metaAnchor = 0; awaitingProgress = false;
         metaTitle.clear(); metaArtist.clear(); metaAlbum.clear(); metaPosition = metaDuration = 0;
         if (!coverPath.empty()) remove(coverPath.c_str());
         coverPath.clear(); artHash = 0; publishMeta(false);
@@ -230,16 +232,17 @@ struct Receiver {
     }
     void publishMeta(bool active) {
         metaActive = active; metaDirty = true; metaRetry = tickSeconds() + 0.5;
+        const char* target = metaSlot ? "sdmc:/config/songate-nx/airplay-state-b.txt" : metaPath;
         FILE* f = fopen(metaTmp, "wb");
         if (!f) { lg("metadata state open failed errno=%d", errno); return; }
-        const int n = fprintf(f, "%d\n%.3f\n%.3f\n%s\n%s\n%s\n%d\n%.6f\n%s\n", int(active), metaPosition, metaDuration, metaTitle.c_str(), metaArtist.c_str(), metaAlbum.c_str(), int(metaPlaying), metaAnchor, coverPath.c_str());
+        const int n = fprintf(f, "%d\n%.3f\n%.3f\n%s\n%s\n%s\n%d\n%.6f\n%s\n%.9f\n%llu\n", int(active), metaPosition, metaDuration, metaTitle.c_str(), metaArtist.c_str(), metaAlbum.c_str(), int(metaPlaying), metaAnchor, coverPath.c_str(), tickSeconds(), (unsigned long long)artHash);
         const int writeErr = n < 0 ? errno : 0;
         const int rc = fclose(f);
         if (n < 0 || rc) { lg("metadata state write/close failed n=%d rc=%d errno=%d", n, rc, n < 0 ? writeErr : errno); remove(metaTmp); return; }
         // libnx SD filesystem rename may not replace an existing destination.
-        if (remove(metaPath) && errno != ENOENT) { lg("metadata state remove failed errno=%d", errno); return; }
-        if (rename(metaTmp, metaPath)) { lg("metadata state rename failed errno=%d", errno); return; }
-        metaDirty = false;
+        if (remove(target) && errno != ENOENT) { lg("metadata state remove failed errno=%d", errno); return; }
+        if (rename(metaTmp, target)) { lg("metadata state rename failed errno=%d", errno); return; }
+        metaSlot = !metaSlot; metaDirty = false;
         lg("metadata state saved: active=%d bytes=%d", int(active), n);
     }
     void coverChunk(Conn& c, const char* data, size_t n) {
@@ -708,7 +711,7 @@ struct Receiver {
                 reply = "RTSP/1.0 455 Method Not Valid in This State\r\nServer: AirTunes/105.1\r\nCSeq:" + cseq + "\r\n";
             } else {
                 streaming = true;
-                graceUntil = 0; metaPlaying = true; metaAnchor = tickSeconds();
+                graceUntil = 0; awaitingProgress = true; metaPlaying = false; metaAnchor = tickSeconds();
                 publishMeta(true);
                 packets = packetsAtLog = 0;
                 lastStreamLog = tickSeconds();
@@ -718,7 +721,7 @@ struct Receiver {
                 lg("RECORD: streaming");
             }
         } else if (method == "PAUSE") {
-            if (&c == streamConn) { freezeClock(); publishMeta(true); }
+            if (&c == streamConn) { awaitingProgress = false; freezeClock(); publishMeta(true); }
         } else if (method == "FLUSH") {
             lg("FLUSH");
             audio.flush();
@@ -749,17 +752,18 @@ struct Receiver {
                 };
                 const auto title = tag("minm"), artist = tag("asar"), album = tag("asal");
                 if (&c == streamConn) {
-                    if (!title.empty()) metaTitle = title;
-                    if (!artist.empty()) metaArtist = artist;
-                    if (!album.empty()) metaAlbum = album;
-                    publishMeta(metaActive);
+                    bool changed = false;
+                    if (!title.empty() && title != metaTitle) { metaTitle = title; changed = true; }
+                    if (!artist.empty() && artist != metaArtist) { metaArtist = artist; changed = true; }
+                    if (!album.empty() && album != metaAlbum) { metaAlbum = album; changed = true; }
+                    if (changed) publishMeta(metaActive);
                 }
                 lg("track: title=%s artist=%s album=%s", tag("minm").c_str(), tag("asar").c_str(), tag("asal").c_str());
             }
             if (type.find("text/parameters") != std::string::npos) {
                 unsigned start=0, current=0, end=0;
                 if (sscanf(lineOf(body, "progress:").c_str(), " %u/%u/%u", &start, &current, &end) == 3) {
-                    if (&c == streamConn) { metaPosition = double(uint32_t(current-start))/44100.0; metaDuration = double(uint32_t(end-start))/44100.0; metaAnchor = tickSeconds(); publishMeta(metaActive); }
+                    if (&c == streamConn) { metaPosition = double(uint32_t(current-start))/44100.0; metaDuration = double(uint32_t(end-start))/44100.0; metaAnchor = tickSeconds(); if (awaitingProgress) { metaPlaying = streaming; awaitingProgress = false; } publishMeta(metaActive); }
                     lg("progress: %.2f / %.2f seconds", double(uint32_t(current-start))/44100.0, double(uint32_t(end-start))/44100.0);
                 }
 
@@ -876,7 +880,12 @@ struct Receiver {
     void pump() {
         onMdns();
         acceptNew();
-        for (Conn& c : conns) if (c.fd >= 0) pumpConn(c);
+        // Service audio between bounded RTSP reads, rather than waiting a full loop per artwork chunk.
+        for (int pass = 0; pass < 3; ++pass) {
+            for (Conn& c : conns) if (c.fd >= 0) pumpConn(c);
+            drainMedia();
+            if (streaming) drain(tickSeconds());
+        }
         drainMedia();
         const double now = tickSeconds();
         if (graceUntil && now >= graceUntil) { lg("presentation grace expired"); clearPresentation(); }
@@ -899,7 +908,7 @@ struct Receiver {
 int main(int, char**) {
     mkdir("sdmc:/config", 0777);
     mkdir("sdmc:/config/songate-nx", 0777);
-    lg("---- airplay-bg step 2 starting (build %s %s, build 6d: presentation clock and artwork cache)", __DATE__, __TIME__);
+    lg("---- airplay-bg step 2 starting (build %s %s, build 6e: clock resync and bounded RTSP reads)", __DATE__, __TIME__);
 
     // Small buffers: the default config's are sized for a game. Fields set by name, so the struct's order does not matter.
     SocketInitConfig cfg = *socketGetDefaultInitConfig();
@@ -914,6 +923,7 @@ int main(int, char**) {
 
     static Receiver rx;
     rx.readConsoleName();
+    remove(metaPath); remove("sdmc:/config/songate-nx/airplay-state-b.txt"); remove(metaTmp);
     remove(artPath); remove("sdmc:/config/songate-nx/airplay-cover-b.jpg"); remove(artTmp); rx.publishMeta(false);
 
     bool sockets = false;

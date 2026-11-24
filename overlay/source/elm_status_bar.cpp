@@ -1204,25 +1204,33 @@ bool StatusBar::onTouch(tsl::elm::TouchEvent event, s32 currX, s32 currY,
 // update
 // ---------------------------------------------------------------------------
 
-// Build 6c: read the six-line state published by airplay-bg 6b1.
-// No extrapolation: active means connected, not necessarily playing.
+// Build 6e: select newest complete state snapshot and extrapolate from its monotonic anchor.
 bool StatusBar::updateAirplay() {
     const u64 now = ult::nowNs();
-    if (m_air_poll && now - m_air_poll < 250000000ULL) return m_airplay;
+    if (m_air_poll && now - m_air_poll < 150000000ULL) return m_airplay;
     m_air_poll = now;
-    FILE* f = fopen("sdmc:/config/songate-nx/airplay-state.txt", "rb");
-    std::string lines[9];
-    bool valid = f != nullptr;
-    if (f) {
+    std::string lines[11];
+    double newest = -1;
+    bool valid = false;
+    for (const char* path : {"sdmc:/config/songate-nx/airplay-state.txt", "sdmc:/config/songate-nx/airplay-state-b.txt"}) {
+        FILE* f = fopen(path, "rb");
+        if (!f) continue;
+        std::string candidate[11]; bool complete = true;
         char buf[2048];
-        for (auto &line : lines) {
-            if (!fgets(buf, sizeof(buf), f)) { valid = false; break; }
+        for (auto &line : candidate) {
+            if (!fgets(buf, sizeof(buf), f)) { complete = false; break; }
             size_t n = strlen(buf);
-            if (!n || buf[n-1] != '\n') { valid = false; break; }
+            if (!n || buf[n-1] != '\n') { complete = false; break; }
             while (n && (buf[n-1] == '\n' || buf[n-1] == '\r')) --n;
             line.assign(buf, n);
         }
         fclose(f);
+        char* end = nullptr;
+        const double stamp = strtod(candidate[9].c_str(), &end);
+        const double clock = double(armTicksToNs(armGetSystemTick())) / 1e9;
+        if (!complete || candidate[9].empty() || *end || !std::isfinite(stamp) || stamp > clock || stamp <= newest) continue;
+        newest = stamp; valid = true;
+        for (int i = 0; i < 11; ++i) lines[i] = candidate[i];
     }
     if (!valid && m_airplay && ++m_air_misses < 12) return true;
     if (valid) m_air_misses = 0;
@@ -1255,10 +1263,12 @@ bool StatusBar::updateAirplay() {
     const double clock = double(armTicksToNs(armGetSystemTick())) / 1e9;
     if (lines[6] == "1" && anchor > 0 && clock >= anchor) pos = std::min(dur, pos + clock - anchor);
     if (m_air_cover != lines[8]) { m_air_cover = lines[8]; m_air_art_poll = 0; }
+    const u64 expectedHash = strtoull(lines[10].c_str(), nullptr, 10);
     m_percentage = dur > 0 ? float(pos / dur) : 0;
     FmtClock(current_buffer, sizeof(current_buffer), static_cast<u32>(pos));
     FmtClock(total_buffer, sizeof(total_buffer), static_cast<u32>(dur));
-    if (!m_air_art_poll || now - m_air_art_poll >= 1000000000ULL) {
+    if ((!m_art_valid || m_air_hash != expectedHash || m_art_scaled_size != ArtSize()) &&
+        (!m_air_art_poll || now - m_air_art_poll >= 1000000000ULL)) {
         m_air_art_poll = now; updateAirplayArt();
     }
     return true;
