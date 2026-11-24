@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -350,6 +351,92 @@ struct Receiver {
     std::string dacpId;
     uint32_t dacpPeer = 0;
     bool dacpTokenSeen = false;
+    std::string dacpToken, dacpRequest, dacpReply;
+    int dacpFd = -1, dacpStage = 0;
+    unsigned dacpPort = 0, dacpAttempts = 0;
+    size_t dacpSent = 0;
+    double dacpDeadline = 0, dacpPollAt = 0;
+    void stopDacp() { closeFd(dacpFd); dacpStage = 0; dacpReply.clear(); }
+    // Decode compressed DNS names with bounds and pointer-loop protection.
+    bool dacpName(const uint8_t* d, size_t n, size_t& pos, std::string& out) {
+        size_t i=pos; bool jumped=false; out.clear();
+        for (unsigned k=0;k<128 && i<n;++k) {
+            unsigned a=d[i++];
+            if (!a) { if (!jumped) pos=i; return true; }
+            if ((a&192)==192) { if(i>=n) return false; size_t target=((a&63)<<8)|d[i++]; if(!jumped) pos=i; jumped=true; i=target; continue; }
+            if(a>63 || i+a>n || out.size()+a+1>255) return false;
+            if(!out.empty()) out+='.';
+            for(unsigned j=0;j<a;++j) out+=char(tolower(d[i++]));
+        } return false;
+    }
+    void resolveDacp(const uint8_t* d,size_t n) {
+        if(n<12) return;
+        auto u16=[&](size_t i){return unsigned(d[i])*256+d[i+1];};
+        size_t pos=12; std::string name, expected="itunes_ctrl_"+dacpId+"._dacp._tcp.local";
+        for(char& c:expected) c=char(tolower(uint8_t(c)));
+        for(unsigned j=0;j<u16(4);++j) { if(!dacpName(d,n,pos,name)||pos+4>n)return; pos+=4; }
+        unsigned count=u16(6)+u16(8)+u16(10);
+        for(unsigned j=0;j<count;++j) {
+            if(!dacpName(d,n,pos,name)||pos+10>n)return;
+            unsigned type=u16(pos), len=u16(pos+8); bool goodbye=!(d[pos+4]|d[pos+5]|d[pos+6]|d[pos+7]); pos+=10;
+            if(pos+len>n)return;
+            if(type==33 && len>=7 && name==expected) {
+                unsigned port=goodbye?0:u16(pos+4);
+                if(port!=dacpPort) { stopDacp(); dacpPort=port; dacpAttempts=0; dacpPollAt=tickSeconds(); lg("DACP: matching SRV port %u",port); }
+            } pos+=len;
+        }
+    }
+    void finishDacp() {
+        size_t split=dacpReply.find("\r\n\r\n");
+        int status=0; sscanf(dacpReply.c_str(),"HTTP/%*s %d",&status);
+        lg("DACP: status HTTP %d, response bytes %u",status,unsigned(dacpReply.size()));
+        if(status==200 && split!=std::string::npos) {
+            // DMAP containers: report only known numeric fields, never raw response or token.
+            auto scan=[&](auto&& self,size_t p,size_t end,unsigned depth)->void {
+                while(depth<5 && p+8<=end) {
+                    const char* b=dacpReply.data()+p; unsigned len=0; for(int i=4;i<8;++i) len=(len<<8)|uint8_t(b[i]); p+=8;
+                    if(len>end-p)break;
+                    if(!memcmp(b,"cmst",4)||!memcmp(b,"mlog",4)) self(self,p,p+len,depth+1);
+                    else if((!memcmp(b,"caps",4)||!memcmp(b,"cant",4)||!memcmp(b,"cast",4)||!memcmp(b,"cmsr",4)) && (len==1||len==4)) { unsigned v=0; for(unsigned i=0;i<len;++i)v=(v<<8)|uint8_t(dacpReply[p+i]); lg("DACP: %.4s=%u",b,v); }
+                    p+=len;
+                }
+            }; scan(scan,split+4,dacpReply.size(),0);
+        }
+        stopDacp();
+    }
+    void pumpDacp() {
+        double now=tickSeconds();
+        if(dacpFd<0) {
+            if(!dacpPort||dacpToken.empty()||!metaActive||dacpAttempts>=8||now<dacpPollAt)return;
+            ++dacpAttempts; dacpPollAt=now+5; dacpDeadline=now+3;
+            dacpFd=socket(AF_INET,SOCK_STREAM,0); if(dacpFd<0)return;
+            nonBlocking(dacpFd); sockaddr_in to{}; to.sin_family=AF_INET; to.sin_port=htons(dacpPort); to.sin_addr.s_addr=dacpPeer;
+            char addr[INET_ADDRSTRLEN]{}; inet_ntop(AF_INET,&to.sin_addr,addr,sizeof addr);
+            dacpRequest="GET /ctrl-int/1/playstatusupdate?revision-number=1 HTTP/1.1\r\nHost: "+std::string(addr)+":"+std::to_string(dacpPort)+"\r\nActive-Remote: "+dacpToken+"\r\nConnection: close\r\n\r\n";
+            dacpSent=0; dacpReply.clear(); int rc=connect(dacpFd,reinterpret_cast<sockaddr*>(&to),sizeof to);
+            if(rc<0 && errno!=EINPROGRESS && !wouldBlock()) { lg("DACP: connect failed errno=%d",errno); stopDacp(); return; }
+            dacpStage=rc==0?2:1; lg("DACP: read-only status probe %u",dacpAttempts);
+        }
+        if(now>=dacpDeadline) { lg("DACP: probe timeout stage=%d bytes=%u",dacpStage,unsigned(dacpReply.size())); stopDacp(); return; }
+        if(dacpStage==1) {
+            fd_set w; FD_ZERO(&w); if(dacpFd>=FD_SETSIZE){stopDacp();return;} FD_SET(dacpFd,&w); timeval tv{};
+            if(select(dacpFd+1,nullptr,&w,nullptr,&tv)<=0)return;
+            int err=0; socklen_t len=sizeof err; if(getsockopt(dacpFd,SOL_SOCKET,SO_ERROR,&err,&len)<0||err){lg("DACP: connection failed errno=%d",err?err:errno);stopDacp();return;} dacpStage=2;
+        }
+        if(dacpStage==2) {
+            int n=send(dacpFd,dacpRequest.data()+dacpSent,dacpRequest.size()-dacpSent,0);
+            if(n<0){if(!wouldBlock())stopDacp();return;} dacpSent+=n; if(dacpSent==dacpRequest.size())dacpStage=3;
+        }
+        if(dacpStage==3) {
+            char b[2048]; int n=recv(dacpFd,b,sizeof b,0);
+            if(n==0){finishDacp();return;} if(n<0){if(!wouldBlock())stopDacp();return;}
+            if(dacpReply.size()+n>16384){lg("DACP: response exceeds diagnostic limit");stopDacp();return;} dacpReply.append(b,n);
+            size_t split=dacpReply.find("\r\n\r\n"); if(split!=std::string::npos) {
+                std::string h=dacpReply.substr(0,split); for(char& c:h)c=char(tolower(uint8_t(c)));
+                size_t at=h.find("\r\ncontent-length:"); if(at!=std::string::npos){unsigned long len=strtoul(h.c_str()+at+17,nullptr,10); if(len<=16384 && dacpReply.size()-split-4>=len)finishDacp();}
+            }
+        }
+    }
     unsigned dacpQueries = 0;
     double dacpNext = 0;
     void inspectDacp(Conn& c, const std::string& head) {
@@ -366,13 +453,14 @@ struct Receiver {
             return v;
         };
         std::string id = field("dacp-id");
-        const bool token = !field("active-remote").empty();
+        std::string token = field("active-remote");
         if (id.empty() || id.size() > 32 || id.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) return;
         if (id != dacpId || c.peer != dacpPeer) {
-            dacpId = id; dacpPeer = c.peer; dacpTokenSeen = false; dacpQueries = 0; dacpNext = tickSeconds();
+            stopDacp(); dacpPort=0; dacpAttempts=0; dacpToken.clear(); dacpId = id; dacpPeer = c.peer; dacpTokenSeen = false; dacpQueries = 0; dacpNext = tickSeconds();
             lg("DACP: sender ID received; discovery scheduled");
         }
-        if (token && !dacpTokenSeen) { dacpTokenSeen = true; lg("DACP: Active-Remote token present (not logged)"); }
+        if (!token.empty() && token.size()<=32 && token.find_first_not_of("0123456789")==std::string::npos) { if(token!=dacpToken){stopDacp();dacpAttempts=0;dacpPollAt=tickSeconds();} dacpToken=token; }
+        if (!dacpToken.empty() && !dacpTokenSeen) { dacpTokenSeen = true; lg("DACP: Active-Remote token present (not logged)"); }
     }
     void queryDacp() {
         if (dacpId.empty() || dacpQueries >= 3 || tickSeconds() < dacpNext) return;
@@ -429,6 +517,7 @@ struct Receiver {
         while ((n = int(recvfrom(mdns, d, sizeof d, 0, reinterpret_cast<sockaddr*>(&from), &len))) > 0) {
             len = sizeof from;
             if (n > 12 && (d[2] & 0x80) && from.sin_addr.s_addr == dacpPeer && !dacpId.empty() && (holds(d,size_t(n),"_dacp") || holds(d,size_t(n),"iTunes_Ctrl_"))) {
+                resolveDacp(d,size_t(n));
                 lg("DACP: sender mDNS response (%d bytes); instance match=%d", n, int(holds(d,size_t(n),dacpId.c_str())));
             }
             if (from.sin_addr.s_addr == ip || n <= 12 || (d[2] & 0x80) || !holds(d, size_t(n), "_raop")) continue;
@@ -505,6 +594,7 @@ struct Receiver {
     }
 
     void closeAll(bool sayGoodbye) {
+        stopDacp(); dacpPort=0; dacpToken.clear(); dacpId.clear(); dacpPeer=0;
         if (sayGoodbye && open && mdns >= 0) sayAnnounce(buildAnnounce(0));   // iOS lists it no longer
         endStream();
         for (Conn& c : conns) { closeFd(c.fd); c.in.clear(); c.skip = 0; }
@@ -928,6 +1018,7 @@ struct Receiver {
     void pump() {
         onMdns();
         queryDacp();
+        pumpDacp();
         acceptNew();
         // Service audio between bounded RTSP reads, rather than waiting a full loop per artwork chunk.
         for (int pass = 0; pass < 3; ++pass) {
@@ -966,7 +1057,7 @@ struct Receiver {
 int main(int, char**) {
     mkdir("sdmc:/config", 0777);
     mkdir("sdmc:/config/songate-nx", 0777);
-    lg("---- airplay-bg step 2 starting (build %s %s, build 7a: DACP discovery diagnostics)", __DATE__, __TIME__);
+    lg("---- airplay-bg step 2 starting (build %s %s, build 7b: read-only DACP status probes)", __DATE__, __TIME__);
 
     // Small buffers: the default config's are sized for a game. Fields set by name, so the struct's order does not matter.
     SocketInitConfig cfg = *socketGetDefaultInitConfig();
