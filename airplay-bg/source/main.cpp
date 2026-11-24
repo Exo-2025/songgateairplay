@@ -192,7 +192,8 @@ struct Receiver {
     // the stream, as far as step 1 follows it
     bool streaming = false;
     unsigned long packets = 0, packetsAtLog = 0;
-    double lastAnnounce = 0, lastStreamLog = 0;
+    double lastAnnounce = 0, lastStreamLog = 0, lastAlive = 0;
+    unsigned questions = 0, accepted = 0;
 
     Receiver() {
         mbedtls_pk_init(&pk);
@@ -269,6 +270,7 @@ struct Receiver {
         while ((n = int(recvfrom(mdns, d, sizeof d, 0, reinterpret_cast<sockaddr*>(&from), &len))) > 0) {
             len = sizeof from;
             if (from.sin_addr.s_addr == ip || n <= 12 || (d[2] & 0x80) || !holds(d, size_t(n), "_raop")) continue;
+            if (++questions <= 5) { const uint8_t* q = reinterpret_cast<const uint8_t*>(&from.sin_addr.s_addr); lg("mDNS question from %u.%u.%u.%u:%u: answered", q[0], q[1], q[2], q[3], unsigned(ntohs(from.sin_port))); }
             sayAnnounce(announce);
             // asked from another port (a sender that holds 5353 itself): the answer goes straight back as well (legacy unicast)
             if (ntohs(from.sin_port) != 5353) sendto(mdns, announce.data(), announce.size(), 0, reinterpret_cast<sockaddr*>(&from), sizeof from);
@@ -388,8 +390,9 @@ struct Receiver {
             const ssize_t n = ::send(c.fd, s.data() + off, s.size() - off, 0);
             if (n > 0) off += size_t(n);
             else if (n < 0 && wouldBlock()) svcSleepThread(1'000'000ull);
-            else break;
+            else { lg("send failed (errno %d)", errno); break; }
         }
+        if (off < s.size()) lg("reply not fully sent (%zu of %zu)", off, s.size());
     }
 
     void hangUp(Conn& c) {
@@ -402,6 +405,7 @@ struct Receiver {
 
     void onRequest(Conn& c, const std::string& head, const std::string& body) {
         const std::string method = head.substr(0, head.find(' '));
+        lg("RTSP %s%s", method.substr(0, 20).c_str(), lineOf(head, "Apple-Challenge:").empty() ? "" : " (with challenge)");
         std::string cseq = lineOf(head, "CSeq:");
         if (cseq.size() > 16) cseq.resize(16);
         std::string reply = "RTSP/1.0 200 OK\r\nServer: AirTunes/105.1\r\nCSeq:" + cseq + "\r\n";
@@ -465,7 +469,9 @@ struct Receiver {
             sockaddr_in from{};
             socklen_t len = sizeof from;
             const int fd = accept(listener, reinterpret_cast<sockaddr*>(&from), &len);
-            if (fd < 0) return;
+            if (fd < 0) { if (!wouldBlock()) lg("accept failed (errno %d)", errno); return; }
+            accepted++;
+            { const uint8_t* q = reinterpret_cast<const uint8_t*>(&from.sin_addr.s_addr); lg("RTSP connection from %u.%u.%u.%u", q[0], q[1], q[2], q[3]); }
             // Only this network's own addresses may talk to it (the app checks the same)
             Conn* slot = nullptr;
             for (Conn& c : conns) if (c.fd < 0) { slot = &c; break; }
@@ -486,9 +492,9 @@ struct Receiver {
             if (n > 0) {
                 c.in.append(buf, size_t(n));
                 if (c.in.size() > kMaxHead + kMaxBody) { lg("request too big: dropped"); hangUp(c); return; }
-            } else if (n == 0) { hangUp(c); return; }
+            } else if (n == 0) { lg("peer closed the connection (%zu bytes unread)", c.in.size()); hangUp(c); return; }
             else if (wouldBlock()) break;
-            else { hangUp(c); return; }
+            else { lg("recv failed (errno %d)", errno); hangUp(c); return; }
         }
         for (;;) {   // whole requests only; a body still arriving waits
             const size_t end = c.in.find("\r\n\r\n");
@@ -527,7 +533,8 @@ struct Receiver {
             packetsAtLog = packets;
             lastStreamLog = now;
         }
-        if (now - lastAnnounce >= 30) { sayAnnounce(announce); lastAnnounce = now; }   // (iOS also asks; this is for one that missed it)
+        if (now - lastAnnounce >= 30) { sayAnnounce(announce); lastAnnounce = now; }
+        if (now - lastAlive >= 30) { lastAlive = now; lg("alive: %u mDNS questions, %u RTSP connections so far", questions, accepted); }   // (iOS also asks; this is for one that missed it)
     }
 };
 
