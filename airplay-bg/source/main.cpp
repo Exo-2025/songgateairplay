@@ -346,6 +346,45 @@ struct Receiver {
         for (char& c : host) c = char(tolower(uint8_t(c)));
     }
 
+    // ---- DACP discovery diagnostics (no playback commands)
+    std::string dacpId;
+    uint32_t dacpPeer = 0;
+    bool dacpTokenSeen = false;
+    unsigned dacpQueries = 0;
+    double dacpNext = 0;
+    void inspectDacp(Conn& c, const std::string& head) {
+        std::string lower = head;
+        for (char& ch : lower) ch = char(tolower(uint8_t(ch)));
+        auto field = [&](const char* key) {
+            size_t pos = lower.find(std::string("\r\n") + key + ":");
+            if (pos == std::string::npos) return std::string();
+            pos += strlen(key) + 3;
+            size_t end = head.find_first_of("\r\n", pos);
+            std::string v = head.substr(pos, end == std::string::npos ? end : end-pos);
+            while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(0,1);
+            while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.pop_back();
+            return v;
+        };
+        std::string id = field("dacp-id");
+        const bool token = !field("active-remote").empty();
+        if (id.empty() || id.size() > 32 || id.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) return;
+        if (id != dacpId || c.peer != dacpPeer) {
+            dacpId = id; dacpPeer = c.peer; dacpTokenSeen = false; dacpQueries = 0; dacpNext = tickSeconds();
+            lg("DACP: sender ID received; discovery scheduled");
+        }
+        if (token && !dacpTokenSeen) { dacpTokenSeen = true; lg("DACP: Active-Remote token present (not logged)"); }
+    }
+    void queryDacp() {
+        if (dacpId.empty() || dacpQueries >= 3 || tickSeconds() < dacpNext) return;
+        std::vector<uint8_t> q;
+        put16(q,0); put16(q,0); put16(q,2); put16(q,0); put16(q,0); put16(q,0);
+        dnsName(q, {"_dacp", "_tcp", "local"}); put16(q,12); put16(q,1);
+        dnsName(q, {"iTunes_Ctrl_" + dacpId, "_dacp", "_tcp", "local"}); put16(q,33); put16(q,1);
+        sockaddr_in g{}; g.sin_family=AF_INET; g.sin_port=htons(5353); g.sin_addr.s_addr=inet_addr("224.0.0.251");
+        int rc = sendto(mdns,q.data(),q.size(),0,reinterpret_cast<sockaddr*>(&g),sizeof g);
+        lg("DACP: discovery query %u %s", ++dacpQueries, rc < 0 ? "failed" : "sent");
+        dacpNext = tickSeconds() + 3.0;
+    }
     // ---- mDNS
 
     std::vector<uint8_t> buildAnnounce(unsigned ttl) {
@@ -389,6 +428,9 @@ struct Receiver {
         int n;
         while ((n = int(recvfrom(mdns, d, sizeof d, 0, reinterpret_cast<sockaddr*>(&from), &len))) > 0) {
             len = sizeof from;
+            if (n > 12 && (d[2] & 0x80) && from.sin_addr.s_addr == dacpPeer && !dacpId.empty() && (holds(d,size_t(n),"_dacp") || holds(d,size_t(n),"iTunes_Ctrl_"))) {
+                lg("DACP: sender mDNS response (%d bytes); instance match=%d", n, int(holds(d,size_t(n),dacpId.c_str())));
+            }
             if (from.sin_addr.s_addr == ip || n <= 12 || (d[2] & 0x80) || !holds(d, size_t(n), "_raop")) continue;
             if (++questions <= 5) { const uint8_t* q = reinterpret_cast<const uint8_t*>(&from.sin_addr.s_addr); lg("mDNS question from %u.%u.%u.%u:%u: answered", q[0], q[1], q[2], q[3], unsigned(ntohs(from.sin_port))); }
             sayAnnounce(announce);
@@ -665,6 +707,7 @@ struct Receiver {
     void onRequest(Conn& c, const std::string& head, const std::string& body) {
         const std::string method = head.substr(0, head.find(' '));
         lg("RTSP %s%s", method.substr(0, 20).c_str(), lineOf(head, "Apple-Challenge:").empty() ? "" : " (with challenge)");
+        inspectDacp(c, head);
         std::string cseq = lineOf(head, "CSeq:");
         if (cseq.size() > 16) cseq.resize(16);
         std::string reply = "RTSP/1.0 200 OK\r\nServer: AirTunes/105.1\r\nCSeq:" + cseq + "\r\n";
@@ -884,6 +927,7 @@ struct Receiver {
 
     void pump() {
         onMdns();
+        queryDacp();
         acceptNew();
         // Service audio between bounded RTSP reads, rather than waiting a full loop per artwork chunk.
         for (int pass = 0; pass < 3; ++pass) {
@@ -922,7 +966,7 @@ struct Receiver {
 int main(int, char**) {
     mkdir("sdmc:/config", 0777);
     mkdir("sdmc:/config/songate-nx", 0777);
-    lg("---- airplay-bg step 2 starting (build %s %s, build 6f: 60-second grace and RTP clock hold)", __DATE__, __TIME__);
+    lg("---- airplay-bg step 2 starting (build %s %s, build 7a: DACP discovery diagnostics)", __DATE__, __TIME__);
 
     // Small buffers: the default config's are sized for a game. Fields set by name, so the struct's order does not matter.
     SocketInitConfig cfg = *socketGetDefaultInitConfig();
