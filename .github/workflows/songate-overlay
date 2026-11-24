@@ -1,0 +1,29 @@
+name: Songate overlay 6c
+on:
+  workflow_dispatch:
+  push:
+    paths: ['overlay/**', 'sysmodule/include/**', '.github/workflows/songate-overlay.yml']
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          for i in 1 2 3 4 5; do
+            if dkp-pacman -Sy --needed --noconfirm switch-curl switch-zlib switch-mbedtls; then exit 0; fi
+            sleep $((i * 15))
+          done
+          exit 1
+      - name: Build overlay
+        run: make -C overlay
+      - name: Package overlay
+        run: |
+          mkdir -p out/switch/.overlays
+          cp overlay/Songate.ovl out/switch/.overlays/Songate.ovl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: songate-overlay-6c
+          path: out
+          include-hidden-files: true
