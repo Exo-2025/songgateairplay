@@ -219,6 +219,9 @@ struct Receiver {
     bool metaSlot = false;
     bool awaitingProgress = false;
     double lastMediaAt = 0;
+    uint32_t lastRtpStamp = 0, progressStart = 0, progressEnd = 0;
+    double progressAt = 0;
+    bool haveRtpStamp = false;
     bool mediaClockHeld = false;
     static constexpr double pauseGrace = 60.0;
     static constexpr double mediaIdle = 0.75;
@@ -229,7 +232,7 @@ struct Receiver {
         metaPlaying = false; metaAnchor = tickSeconds();
     }
     void clearPresentation() {
-        lastMediaAt = 0; mediaClockHeld = false; graceUntil = 0; metaPlaying = false; metaAnchor = 0; awaitingProgress = false;
+        lastMediaAt = 0; haveRtpStamp = false; progressAt = 0; mediaClockHeld = false; graceUntil = 0; metaPlaying = false; metaAnchor = 0; awaitingProgress = false;
         metaTitle.clear(); metaArtist.clear(); metaAlbum.clear(); metaPosition = metaDuration = 0;
         if (!coverPath.empty()) remove(coverPath.c_str());
         coverPath.clear(); artHash = 0; publishMeta(false);
@@ -374,16 +377,34 @@ struct Receiver {
         auto u16=[&](size_t i){return unsigned(d[i])*256+d[i+1];};
         size_t pos=12; std::string name, expected="itunes_ctrl_"+dacpId+"._dacp._tcp.local";
         for(char& c:expected) c=char(tolower(uint8_t(c)));
-        for(unsigned j=0;j<u16(4);++j) { if(!dacpName(d,n,pos,name)||pos+4>n)return; pos+=4; }
+        auto matches=[&](const std::string& v) {
+            const std::string prefix="itunes_ctrl_", suffix="._dacp._tcp.local";
+            if(v==expected)return true;
+            if(v.size()<=prefix.size()+suffix.size() || v.compare(0,prefix.size(),prefix) || v.compare(v.size()-suffix.size(),suffix.size(),suffix))return false;
+            auto norm=[](std::string x){size_t k=x.find_first_not_of('0');return k==std::string::npos?std::string("0"):x.substr(k);};
+            return norm(v.substr(prefix.size(),v.size()-prefix.size()-suffix.size()))==norm(expected.substr(prefix.size(),expected.size()-prefix.size()-suffix.size()));
+        };
+        for(unsigned j=0;j<u16(4);++j) { if(!dacpName(d,n,pos,name)||pos+4>n){lg("DACP: malformed DNS question");return;} pos+=4; }
         unsigned count=u16(6)+u16(8)+u16(10);
         for(unsigned j=0;j<count;++j) {
-            if(!dacpName(d,n,pos,name)||pos+10>n)return;
+            if(!dacpName(d,n,pos,name)||pos+10>n){lg("DACP: malformed DNS record %u",j);return;}
             unsigned type=u16(pos), len=u16(pos+8); bool goodbye=!(d[pos+4]|d[pos+5]|d[pos+6]|d[pos+7]); pos+=10;
-            if(pos+len>n)return;
-            if(type==33 && len>=7 && name==expected) {
-                unsigned port=goodbye?0:u16(pos+4);
-                if(port!=dacpPort) { stopDacp(); dacpPort=port; dacpAttempts=0; dacpPollAt=tickSeconds(); lg("DACP: matching SRV port %u",port); }
-            } pos+=len;
+            if(pos+len>n){lg("DACP: truncated DNS record %u",j);return;}
+            if(type==12 && name=="_dacp._tcp.local") {
+                size_t q=pos; std::string target;
+                if(dacpName(d,n,q,target)&&q<=pos+len)lg("DACP: PTR instance match=%d",int(matches(target)));
+            }
+            if(type==33 && len>=7) {
+                unsigned port=u16(pos+4); size_t q=pos+6; std::string target;
+                bool valid=dacpName(d,n,q,target)&&q<=pos+len;
+                bool match=matches(name);
+                lg("DACP: SRV port=%u match=%d target-valid=%d goodbye=%d",port,int(match),int(valid),int(goodbye));
+                if(match && valid) {
+                    if(goodbye)port=0;
+                    if(port!=dacpPort) { stopDacp(); dacpPort=port; dacpAttempts=0; dacpPollAt=tickSeconds(); lg("DACP: matching SRV port %u",port); }
+                }
+            } else if(name.find("._dacp._tcp.local")!=std::string::npos) lg("DACP: DNS record type=%u length=%u match=%d",type,len,int(matches(name)));
+            pos+=len;
         }
     }
     void finishDacp() {
@@ -463,11 +484,11 @@ struct Receiver {
         if (!dacpToken.empty() && !dacpTokenSeen) { dacpTokenSeen = true; lg("DACP: Active-Remote token present (not logged)"); }
     }
     void queryDacp() {
-        if (dacpId.empty() || dacpQueries >= 3 || tickSeconds() < dacpNext) return;
+        if (dacpId.empty() || dacpPort || dacpQueries >= 6 || tickSeconds() < dacpNext) return;
         std::vector<uint8_t> q;
         put16(q,0); put16(q,0); put16(q,2); put16(q,0); put16(q,0); put16(q,0);
         dnsName(q, {"_dacp", "_tcp", "local"}); put16(q,12); put16(q,1);
-        dnsName(q, {"iTunes_Ctrl_" + dacpId, "_dacp", "_tcp", "local"}); put16(q,33); put16(q,1);
+        dnsName(q, {"iTunes_Ctrl_" + dacpId, "_dacp", "_tcp", "local"}); put16(q,33); put16(q,0x8001);
         sockaddr_in g{}; g.sin_family=AF_INET; g.sin_port=htons(5353); g.sin_addr.s_addr=inet_addr("224.0.0.251");
         int rc = sendto(mdns,q.data(),q.size(),0,reinterpret_cast<sockaddr*>(&g),sizeof g);
         lg("DACP: discovery query %u %s", ++dacpQueries, rc < 0 ? "failed" : "sent");
@@ -516,7 +537,7 @@ struct Receiver {
         int n;
         while ((n = int(recvfrom(mdns, d, sizeof d, 0, reinterpret_cast<sockaddr*>(&from), &len))) > 0) {
             len = sizeof from;
-            if (n > 12 && (d[2] & 0x80) && from.sin_addr.s_addr == dacpPeer && !dacpId.empty() && (holds(d,size_t(n),"_dacp") || holds(d,size_t(n),"iTunes_Ctrl_"))) {
+            if (n > 12 && (d[2] & 0x80) && from.sin_addr.s_addr == dacpPeer && !dacpId.empty()) {
                 resolveDacp(d,size_t(n));
                 lg("DACP: sender mDNS response (%d bytes); instance match=%d", n, int(holds(d,size_t(n),dacpId.c_str())));
             }
@@ -849,7 +870,7 @@ struct Receiver {
             } else {
                 streaming = true;
                 lastMediaAt = 0; mediaClockHeld = false;
-                graceUntil = 0; awaitingProgress = true; metaPlaying = false; metaAnchor = tickSeconds();
+                graceUntil = 0; progressAt = 0; haveRtpStamp = false; awaitingProgress = true; metaPlaying = false; metaAnchor = tickSeconds();
                 publishMeta(true);
                 packets = packetsAtLog = 0;
                 lastStreamLog = tickSeconds();
@@ -861,7 +882,7 @@ struct Receiver {
         } else if (method == "PAUSE") {
             if (&c == streamConn) { awaitingProgress = false; mediaClockHeld = false; freezeClock(); publishMeta(true); }
         } else if (method == "FLUSH") {
-            lg("FLUSH");
+            lg("FLUSH"); progressAt=0; haveRtpStamp=false;
             audio.flush();
             haveNext = false;
             if (slots) for (int i = 0; i < kSlots; i++) slots[i].have = false;
@@ -901,7 +922,18 @@ struct Receiver {
             if (type.find("text/parameters") != std::string::npos) {
                 unsigned start=0, current=0, end=0;
                 if (sscanf(lineOf(body, "progress:").c_str(), " %u/%u/%u", &start, &current, &end) == 3) {
-                    if (&c == streamConn) { metaPosition = double(uint32_t(current-start))/44100.0; metaDuration = double(uint32_t(end-start))/44100.0; metaAnchor = tickSeconds(); if (mediaClockHeld) { mediaClockHeld = false; metaPlaying = streaming; } if (awaitingProgress) { metaPlaying = streaming; awaitingProgress = false; } publishMeta(metaActive); }
+                    if (&c == streamConn) {
+                        const double now=tickSeconds(), reported=double(uint32_t(current-start))/44100.0;
+                        const double duration=double(uint32_t(end-start))/44100.0;
+                        const double predicted=metaPosition+std::max(0.0,now-metaAnchor);
+                        const double lag=predicted-reported;
+                        const bool duplicate=metaPlaying && !awaitingProgress && !mediaClockHeld && progressAt>0 && now-progressAt<1.5 && start==progressStart && end==progressEnd && lag>0.0 && lag<0.85;
+                        metaPosition=std::min(duration,duplicate?predicted:reported); metaDuration=duration; metaAnchor=now;
+                        if(duplicate)lg("clock: held near-duplicate progress correction %.3f s",lag);
+                        if(haveRtpStamp)lg("clock: RTP minus progress ticks=%lld",(long long)(int32_t)(lastRtpStamp-current));
+                        progressAt=now; progressStart=start; progressEnd=end;
+                        if (mediaClockHeld) { mediaClockHeld = false; metaPlaying = streaming; } if (awaitingProgress) { metaPlaying = streaming; awaitingProgress = false; } publishMeta(metaActive);
+                    }
                     lg("progress: %.2f / %.2f seconds", double(uint32_t(current-start))/44100.0, double(uint32_t(end-start))/44100.0);
                 }
 
@@ -1003,7 +1035,7 @@ struct Receiver {
             socklen_t len = sizeof src;
             const ssize_t n = recvfrom(media[0], d, sizeof d, 0, reinterpret_cast<sockaddr*>(&src), &len);
             if (n <= 0) break;
-            if (streaming && src.sin_addr.s_addr == clientIp && n > 12 && (d[1] & 0x7f) == 0x60) { lastMediaAt = now; packets++; take(d, int(n), now, false); }
+            if (streaming && src.sin_addr.s_addr == clientIp && n > 12 && (d[1] & 0x7f) == 0x60) { lastMediaAt = now; lastRtpStamp=(uint32_t(d[4])<<24)|(uint32_t(d[5])<<16)|(uint32_t(d[6])<<8)|uint32_t(d[7]); haveRtpStamp=true; packets++; take(d, int(n), now, false); }
         }
         for (int k = 0; k < 32; k++) {   // the control port: packets sent again (type 0x56, the packet 4 bytes in); its sync packets are not used yet
             sockaddr_in src{};
@@ -1057,7 +1089,7 @@ struct Receiver {
 int main(int, char**) {
     mkdir("sdmc:/config", 0777);
     mkdir("sdmc:/config/songate-nx", 0777);
-    lg("---- airplay-bg step 2 starting (build %s %s, build 7b: read-only DACP status probes)", __DATE__, __TIME__);
+    lg("---- airplay-bg step 2 starting (build %s %s, build 7b2: DNS records and clock diagnostics)", __DATE__, __TIME__);
 
     // Small buffers: the default config's are sized for a game. Fields set by name, so the struct's order does not matter.
     SocketInitConfig cfg = *socketGetDefaultInitConfig();
